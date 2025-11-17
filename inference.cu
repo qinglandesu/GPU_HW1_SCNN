@@ -8,32 +8,14 @@
 #include <algorithm>
 
 // TODO
-/*
+/**/
 __device__ __host__ uint32_t __builtin_bswap32(uint32_t val) {
     return ((val & 0x000000FF) << 24) |
            ((val & 0x0000FF00) << 8) |
            ((val & 0x00FF0000) >> 8) |
            ((val & 0xFF000000) >> 24);
 }
-*/
-// 多通道 2D 卷积：输入/输出都是 NCHW，这里 N=1（batch=1）
-__global__ void conv2d_forward(
-    const float* __restrict__ in,   // [C_in, H_in, W_in]
-    const float* __restrict__ w,    // [C_out, C_in, K, K]
-    const float* __restrict__ b,    // [C_out]
-    float* __restrict__ out,        // [C_out, H_out, W_out]
-    int C_in, int H_in, int W_in,
-    int C_out,
-    int K, int stride, int padding
-);
 
-// 2D 最大池化：NCHW，N=1
-__global__ void maxpool2d_forward(
-    const float* __restrict__ in,   // [C, H_in, W_in]
-    float* __restrict__ out,        // [C, H_out, W_out]
-    int C, int H_in, int W_in,
-    int K, int stride
-);
 
 // IF 脉冲神经元：逐元素更新膜电位并生成 0/1 脉冲
 __global__ void ifnode_forward(
@@ -44,30 +26,7 @@ __global__ void ifnode_forward(
     float threshold                 // 阈值，一般 1.0f
 );
 
-// Flatten：把 [C,H,W] 展平成 [C*H*W]
-__global__ void flatten_forward(
-    const float* __restrict__ in,   // [C, H, W]
-    float* __restrict__ out,        // [C*H*W]
-    int C, int H, int W
-);
-
-// 全连接层 y = W x + b
-__global__ void linear_forward(
-    const float* __restrict__ x,    // [in_features]
-    const float* __restrict__ W,    // [out_features, in_features]
-    const float* __restrict__ b,    // [out_features]
-    float* __restrict__ y,          // [out_features]
-    int in_features,
-    int out_features
-);
-
-// 把当前时间步的 logits 累加到 logits_sum 上： logits_sum += logits_t
-__global__ void add_logits(
-    const float* __restrict__ logits_t, // [10]
-    float* __restrict__ logits_sum,     // [10]
-    int num_classes                     // =10
-);
-
+// 多通道 2D 卷积：输入/输出都是 NCHW
 __global__ void conv2d_forward_batch(
     const float* __restrict__ in,
     const float* __restrict__ w,
@@ -78,6 +37,7 @@ __global__ void conv2d_forward_batch(
     int K, int stride, int padding
 );
 
+// 2D 最大池化：NCHW
 __global__ void maxpool2d_forward_batch(
     const float* __restrict__ in,
     float* __restrict__ out,
@@ -85,6 +45,7 @@ __global__ void maxpool2d_forward_batch(
     int K, int stride
 );
 
+// 全连接层 y = W x + b
 __global__ void linear_forward_batch(
     const float* __restrict__ x,
     const float* __restrict__ W,
@@ -95,6 +56,7 @@ __global__ void linear_forward_batch(
     int out_features
 );
 
+// 把当前时间步的 logits 累加到 logits_sum 上： logits_sum += logits_t
 __global__ void add_logits_batch(
     const float* __restrict__ logits_t,  // [N, num_classes]
     float* __restrict__ logits_sum,      // [N, num_classes]
@@ -396,20 +358,6 @@ std::vector<int> scnn_inference(
                 checkCudaErrors(cudaGetLastError());
             }
 
-            /*
-            // (7) flatten: [16,4,4] -> [256]
-            {
-                int N = FC1_IN;
-                int blocks = (N + THREADS - 1) / THREADS;
-                flatten_forward<<<blocks, THREADS>>>(
-                    d_pool2_out,
-                    d_flat,
-                    C2_OUT_C, P2_H, P2_W
-                );
-                checkCudaErrors(cudaGetLastError());
-            }
-            */
-
             // (8) fc1 + IF3: [256] -> [120] -> 0/1
             {
                 int blocks_fc1 = (cur_batch * FC1_OUT + THREADS - 1) / THREADS;
@@ -544,8 +492,8 @@ int main(int argc, char* argv[]) {
 	
     // Load test data
     // TODO "/../../.." +
-    auto images = read_mnist_images(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
-    auto labels = read_mnist_labels(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
+    auto images = read_mnist_images(dir +  "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
+    auto labels = read_mnist_labels(dir +  "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
     if (images.empty() || labels.empty()) return 1;
 
     // Load model parameters to host memory
@@ -646,92 +594,6 @@ int main(int argc, char* argv[]) {
 // ===================================================================================
 
 
-// 多通道 2D 卷积：输入/输出都是 NCHW，这里 N=1（batch=1）
-__global__ void conv2d_forward(
-    const float* __restrict__ in,   // [C_in, H_in, W_in]
-    const float* __restrict__ w,    // [C_out, C_in, K, K]
-    const float* __restrict__ b,    // [C_out]
-    float* __restrict__ out,        // [C_out, H_out, W_out]
-    int C_in, int H_in, int W_in,
-    int C_out,
-    int K, int stride, int padding
-)
-{
-    int w_out = blockIdx.x * blockDim.x + threadIdx.x;
-    int h_out = blockIdx.y * blockDim.y + threadIdx.y;
-    int co    = blockIdx.z;  // 输出通道
-
-    // 计算输出空间大小
-    int H_out = (H_in + 2 * padding - K) / stride + 1;
-    int W_out = (W_in + 2 * padding - K) / stride + 1;
-
-    if (co < C_out && h_out < H_out && w_out < W_out) {
-        // 对应的输入中心起点（左上角）
-        int h_in_start = h_out * stride - padding;
-        int w_in_start = w_out * stride - padding;
-
-        float sum = b[co];  // 先加上 bias
-
-        // 卷积求和
-        for (int ci = 0; ci < C_in; ++ci) {
-            for (int kh = 0; kh < K; ++kh) {
-                for (int kw = 0; kw < K; ++kw) {
-                    int h_in = h_in_start + kh;
-                    int w_in = w_in_start + kw;
-
-                    // 带 padding 时要判断越界
-                    if (h_in < 0 || h_in >= H_in || w_in < 0 || w_in >= W_in)
-                        continue;
-
-                    int idx_in = ci * H_in * W_in + h_in * W_in + w_in;
-                    // w 的 index: [co, ci, kh, kw]
-                    int idx_w  = ((co * C_in + ci) * K + kh) * K + kw;
-
-                    sum += in[idx_in] * w[idx_w];
-                }
-            }
-        }
-
-        int idx_out = co * H_out * W_out + h_out * W_out + w_out;
-        out[idx_out] = sum;
-    }
-}
-
-// 2D 最大池化：NCHW，N=1
-__global__ void maxpool2d_forward(
-    const float* __restrict__ in,   // [C, H_in, W_in]
-    float* __restrict__ out,        // [C, H_out, W_out]
-    int C, int H_in, int W_in,
-    int K, int stride
-)
-{
-    int w_out = blockIdx.x * blockDim.x + threadIdx.x;
-    int h_out = blockIdx.y * blockDim.y + threadIdx.y;
-    int c     = blockIdx.z;   // 一个 block.z 对应一个通道
-
-    int H_out = (H_in - K) / stride + 1;
-    int W_out = (W_in - K) / stride + 1;
-
-    if (c < C && h_out < H_out && w_out < W_out) {
-        int h_start = h_out * stride;
-        int w_start = w_out * stride;
-
-        float max_val = -1e30f;  // 很小的初始值
-        for (int kh = 0; kh < K; ++kh) {
-            for (int kw = 0; kw < K; ++kw) {
-                int h = h_start + kh;
-                int w = w_start + kw;
-                int idx_in = c * H_in * W_in + h * W_in + w;
-                float v = in[idx_in];
-                if (v > max_val) max_val = v;
-            }
-        }
-
-        int idx_out = c * H_out * W_out + h_out * W_out + w_out;
-        out[idx_out] = max_val;
-    }
-}
-
 // IF 脉冲神经元：逐元素更新膜电位并生成 0/1 脉冲
 __global__ void ifnode_forward(
     const float* __restrict__ in,   // 输入电流
@@ -751,56 +613,6 @@ __global__ void ifnode_forward(
             out[i] = 0.0f;
             v[i]   = vi;                 // 没有发放就保持新的膜电位
         }
-    }
-}
-
-// Flatten：把 [C,H,W] 展平成 [C*H*W]
-__global__ void flatten_forward(
-    const float* __restrict__ in,   // [C, H, W]
-    float* __restrict__ out,        // [C*H*W]
-    int C, int H, int W
-)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int N = C * H * W;
-    if (idx < N) {
-        // in 的内存本来就是 C 维优先：in[c*H*W + h*W + w]
-        // 展平后 out[idx] 顺序相同，直接拷贝即可
-        out[idx] = in[idx];
-    }
-}
-
-// 全连接层 y = W x + b
-__global__ void linear_forward(
-    const float* __restrict__ x,    // [in_features]
-    const float* __restrict__ W,    // [out_features, in_features]
-    const float* __restrict__ b,    // [out_features]
-    float* __restrict__ y,          // [out_features]
-    int in_features,
-    int out_features
-)
-{
-    int o = blockIdx.x * blockDim.x + threadIdx.x;
-    if (o < out_features) {
-        float sum = 0.0f;
-        const float* w_row = W + o * in_features;  // 第 o 行
-        for (int j = 0; j < in_features; ++j) {
-            sum += w_row[j] * x[j];
-        }
-        y[o] = sum + b[o];
-    }
-}
-
-// 把当前时间步的 logits 累加到 logits_sum 上： logits_sum += logits_t
-__global__ void add_logits(
-    const float* __restrict__ logits_t, // [10]
-    float* __restrict__ logits_sum,     // [10]
-    int num_classes                     // =10
-)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < num_classes) {
-        logits_sum[i] += logits_t[i];
     }
 }
 
