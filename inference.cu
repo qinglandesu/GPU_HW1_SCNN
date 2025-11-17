@@ -8,14 +8,14 @@
 #include <algorithm>
 
 // TODO
-/**/
+/*
 __device__ __host__ uint32_t __builtin_bswap32(uint32_t val) {
     return ((val & 0x000000FF) << 24) |
            ((val & 0x0000FF00) << 8) |
            ((val & 0x00FF0000) >> 8) |
            ((val & 0xFF000000) >> 24);
 }
-
+*/
 // 多通道 2D 卷积：输入/输出都是 NCHW，这里 N=1（batch=1）
 __global__ void conv2d_forward(
     const float* __restrict__ in,   // [C_in, H_in, W_in]
@@ -68,6 +68,39 @@ __global__ void add_logits(
     int num_classes                     // =10
 );
 
+__global__ void conv2d_forward_batch(
+    const float* __restrict__ in,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int N, int C_in, int H_in, int W_in,
+    int C_out,
+    int K, int stride, int padding
+);
+
+__global__ void maxpool2d_forward_batch(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int N, int C, int H_in, int W_in,
+    int K, int stride
+);
+
+__global__ void linear_forward_batch(
+    const float* __restrict__ x,
+    const float* __restrict__ W,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int N,
+    int in_features,
+    int out_features
+);
+
+__global__ void add_logits_batch(
+    const float* __restrict__ logits_t,  // [N, num_classes]
+    float* __restrict__ logits_sum,      // [N, num_classes]
+    int N,
+    int num_classes
+);
 
 // ===================================================================================
 // Helper for CUDA Error Handling - DO NOT MODIFY BEGIN
@@ -147,6 +180,7 @@ std::vector<int> scnn_inference(
 
     // SNN-specific parameter, must match training
     const int T = 8;
+    const int BATCH = 32;
     // 输入尺寸
     const int IMG_C = 1;
     const int IMG_H = 28;
@@ -190,98 +224,107 @@ std::vector<int> scnn_inference(
     const int FC3_OUT = 10;
 
     // 分配中间特征图和膜电位的 GPU 缓冲区
-    // 输入图像 [1,28,28]
-    float* d_input = nullptr;
-    checkCudaErrors(cudaMalloc(&d_input, IMG_C * IMG_H * IMG_W * sizeof(float)));
     // conv1 / IF1 / pool1
     float *d_conv1_out = nullptr, *d_if1_v = nullptr, *d_if1_out = nullptr;
     float *d_pool1_out = nullptr;
-    checkCudaErrors(cudaMalloc(&d_conv1_out, C1_N * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if1_v,    C1_N * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if1_out,  C1_N * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_pool1_out, P1_N * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_conv1_out, BATCH * C1_N * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_if1_v, BATCH * C1_N * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_if1_out, BATCH * C1_N * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_pool1_out, BATCH * P1_N * sizeof(float)));
     // conv2 / IF2 / pool2
     float *d_conv2_out = nullptr, *d_if2_v = nullptr, *d_if2_out = nullptr;
     float *d_pool2_out = nullptr;
-    checkCudaErrors(cudaMalloc(&d_conv2_out, C2_N * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if2_v,     C2_N * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if2_out,   C2_N * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_pool2_out, P2_N * sizeof(float))); // 16x4x4
+    checkCudaErrors(cudaMalloc(&d_conv2_out, BATCH * C2_N * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_if2_v, BATCH * C2_N * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_if2_out, BATCH * C2_N * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_pool2_out, BATCH * P2_N * sizeof(float))); // 16x4x4
     // flatten 后的向量
     // float* d_flat = nullptr;
     // checkCudaErrors(cudaMalloc(&d_flat, FC1_IN * sizeof(float))); // 256
     // FC1 / IF3
     float *d_fc1_out = nullptr, *d_if3_v = nullptr, *d_if3_out = nullptr;
-    checkCudaErrors(cudaMalloc(&d_fc1_out, FC1_OUT * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if3_v,   FC1_OUT * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if3_out, FC1_OUT * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc1_out, BATCH * FC1_OUT * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_if3_v, BATCH * FC1_OUT * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_if3_out, BATCH * FC1_OUT * sizeof(float)));
     // FC2 / IF4
     float *d_fc2_out = nullptr, *d_if4_v = nullptr, *d_if4_out = nullptr;
-    checkCudaErrors(cudaMalloc(&d_fc2_out, FC2_OUT * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if4_v,   FC2_OUT * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if4_out, FC2_OUT * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc2_out, BATCH * FC2_OUT * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_if4_v, BATCH * FC2_OUT * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_if4_out, BATCH * FC2_OUT * sizeof(float)));
     // FC3 输出 logits
     float* d_fc3_out = nullptr;
-    checkCudaErrors(cudaMalloc(&d_fc3_out, FC3_OUT * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc3_out, BATCH * FC3_OUT * sizeof(float)));
     // logits 累积缓冲区
     float* d_logits_sum = nullptr;
-    checkCudaErrors(cudaMalloc(&d_logits_sum, FC3_OUT * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_logits_sum, BATCH * FC3_OUT * sizeof(float)));
     // host 端读取 logits 用于 argmax
-    std::vector<float> h_logits(FC3_OUT);
+    std::vector<float> h_logits(BATCH * FC3_OUT);
 
     // kernel 启动配置（简单用 1D 配置，conv/pool 自己在实现里用 3D 也可以）
     const int THREADS = 256;
 
+    std::vector<float> h_all_images(num_images * IMG_C * IMG_H * IMG_W);
+    for (int i = 0; i < num_images; ++i) {
+        std::copy(
+            images[i].begin(), images[i].end(),
+            h_all_images.begin() + i * IMG_C * IMG_H * IMG_W
+        );
+    }
+    float* d_all_images = nullptr;
+    checkCudaErrors(cudaMalloc(
+        &d_all_images,
+        h_all_images.size() * sizeof(float)
+    ));
+    checkCudaErrors(cudaMemcpy(
+        d_all_images,
+        h_all_images.data(),
+        h_all_images.size() * sizeof(float),
+        cudaMemcpyHostToDevice
+    ));
 
     // --- Loop over each image ---
-    for (int i = 0; i < num_images; ++i) {
-        // 把当前图片拷贝到 GPU 输入缓冲区
-        // images[i] 大小应该是 28*28
-        checkCudaErrors(cudaMemcpy(
-            d_input,
-            images[i].data(),
-            IMG_C * IMG_H * IMG_W * sizeof(float),
-            cudaMemcpyHostToDevice
-        ));
+    for (int base = 0; base < num_images; base += BATCH) {
+        int cur_batch = std::min(BATCH, num_images - base);
+        // images[i] 大小是 28*28
+        const float* d_input = d_all_images + base * IMG_C * IMG_H * IMG_W;
 
         // 把所有 IF 膜电位清零
-        checkCudaErrors(cudaMemset(d_if1_v, 0, C1_N * sizeof(float)));
-        checkCudaErrors(cudaMemset(d_if2_v, 0, C2_N * sizeof(float)));
-        checkCudaErrors(cudaMemset(d_if3_v, 0, FC1_OUT * sizeof(float)));
-        checkCudaErrors(cudaMemset(d_if4_v, 0, FC2_OUT * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_if1_v, 0, cur_batch * C1_N * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_if2_v, 0, cur_batch * C2_N * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_if3_v, 0, cur_batch * FC1_OUT * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_if4_v, 0, cur_batch * FC2_OUT * sizeof(float)));
         // logits_sum 清零
-        checkCudaErrors(cudaMemset(d_logits_sum, 0, FC3_OUT * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_logits_sum, 0, cur_batch * FC3_OUT * sizeof(float)));
 
+        // (1) conv1: [1,28,28] -> [6,24,24]
+        {
+            dim3 block(16, 16);
+            dim3 grid(
+                (C1_W + block.x - 1) / block.x,
+                (C1_H + block.y - 1) / block.y,
+                cur_batch * C1_OUT_C
+            );
+            conv2d_forward_batch<<<grid, block>>>(
+                d_input,
+                d_conv1_w, d_conv1_b,
+                d_conv1_out,
+                cur_batch, C1_IN_C, IMG_H, IMG_W,
+                C1_OUT_C,
+                C1_K, C1_STR, C1_PAD
+            );
+            checkCudaErrors(cudaGetLastError());
+        }
         // 在 T 个时间步上循环
         for (int t = 0; t < T; ++t) {
-            // (1) conv1: [1,28,28] -> [6,24,24]
-            {
-                dim3 block(16, 16);
-                dim3 grid(
-                    (C1_W + block.x - 1) / block.x,
-                    (C1_H + block.y - 1) / block.y,
-                    C1_OUT_C
-                );
-                conv2d_forward<<<grid, block>>>(
-                    d_input,
-                    d_conv1_w, d_conv1_b,
-                    d_conv1_out,
-                    C1_IN_C, IMG_H, IMG_W,
-                    C1_OUT_C,
-                    C1_K, C1_STR, C1_PAD
-                );
-                checkCudaErrors(cudaGetLastError());
-            }
-
+            
             // (2) IF1: conv1_out -> if1_out (0/1)，更新 d_if1_v
             {
-                int N = C1_N;
-                int blocks = (N + THREADS - 1) / THREADS;
+                int blocks = (cur_batch * C1_N + THREADS - 1) / THREADS;
                 ifnode_forward<<<blocks, THREADS>>>(
                     d_conv1_out,
                     d_if1_v,
                     d_if1_out,
-                    N,
+                    cur_batch * C1_N,
                     1.0f
                 );
                 checkCudaErrors(cudaGetLastError());
@@ -293,12 +336,12 @@ std::vector<int> scnn_inference(
                 dim3 grid(
                     (P1_W + block.x - 1) / block.x,
                     (P1_H + block.y - 1) / block.y,
-                    C1_OUT_C
+                    cur_batch * C1_OUT_C
                 );
-                maxpool2d_forward<<<grid, block>>>(
+                maxpool2d_forward_batch<<<grid, block>>>(
                     d_if1_out,
                     d_pool1_out,
-                    C1_OUT_C, C1_H, C1_W,
+                    cur_batch, C1_OUT_C, C1_H, C1_W,
                     P1_K, P1_STR
                 );
                 checkCudaErrors(cudaGetLastError());
@@ -310,13 +353,13 @@ std::vector<int> scnn_inference(
                 dim3 grid(
                     (C2_W + block.x - 1) / block.x,
                     (C2_H + block.y - 1) / block.y,
-                    C2_OUT_C
+                    cur_batch * C2_OUT_C
                 );
-                conv2d_forward<<<grid, block>>>(
+                conv2d_forward_batch<<<grid, block>>>(
                     d_pool1_out,
                     d_conv2_w, d_conv2_b,
                     d_conv2_out,
-                    C2_IN_C, P1_H, P1_W,
+                    cur_batch, C2_IN_C, P1_H, P1_W,
                     C2_OUT_C,
                     C2_K, C2_STR, C2_PAD
                 );
@@ -325,13 +368,12 @@ std::vector<int> scnn_inference(
 
             // (5) IF2: conv2_out -> if2_out
             {
-                int N = C2_N;
-                int blocks = (N + THREADS - 1) / THREADS;
+                int blocks = (cur_batch * C2_N + THREADS - 1) / THREADS;
                 ifnode_forward<<<blocks, THREADS>>>(
                     d_conv2_out,
                     d_if2_v,
                     d_if2_out,
-                    N,
+                    cur_batch * C2_N,
                     1.0f
                 );
                 checkCudaErrors(cudaGetLastError());
@@ -343,12 +385,12 @@ std::vector<int> scnn_inference(
                 dim3 grid(
                     (P2_W + block.x - 1) / block.x,
                     (P2_H + block.y - 1) / block.y,
-                    C2_OUT_C
+                    cur_batch * C2_OUT_C
                 );
-                maxpool2d_forward<<<grid, block>>>(
+                maxpool2d_forward_batch<<<grid, block>>>(
                     d_if2_out,
                     d_pool2_out,
-                    C2_OUT_C, C2_H, C2_W,
+                    cur_batch, C2_OUT_C, C2_H, C2_W,
                     P2_K, P2_STR
                 );
                 checkCudaErrors(cudaGetLastError());
@@ -370,11 +412,12 @@ std::vector<int> scnn_inference(
 
             // (8) fc1 + IF3: [256] -> [120] -> 0/1
             {
-                int blocks_fc1 = (FC1_OUT + THREADS - 1) / THREADS;
-                linear_forward<<<blocks_fc1, THREADS>>>(
+                int blocks_fc1 = (cur_batch * FC1_OUT + THREADS - 1) / THREADS;
+                linear_forward_batch<<<blocks_fc1, THREADS>>>(
                     d_pool2_out,
                     d_fc1_w, d_fc1_b,
                     d_fc1_out,
+                    cur_batch,
                     FC1_IN, FC1_OUT
                 );
                 checkCudaErrors(cudaGetLastError());
@@ -383,7 +426,7 @@ std::vector<int> scnn_inference(
                     d_fc1_out,
                     d_if3_v,
                     d_if3_out,
-                    FC1_OUT,
+                    cur_batch * FC1_OUT,
                     1.0f
                 );
                 checkCudaErrors(cudaGetLastError());
@@ -391,11 +434,12 @@ std::vector<int> scnn_inference(
 
             // (9) fc2 + IF4: [120] -> [84] -> 0/1
             {
-                int blocks_fc2 = (FC2_OUT + THREADS - 1) / THREADS;
-                linear_forward<<<blocks_fc2, THREADS>>>(
+                int blocks_fc2 = (cur_batch * FC2_OUT + THREADS - 1) / THREADS;
+                linear_forward_batch<<<blocks_fc2, THREADS>>>(
                     d_if3_out,
                     d_fc2_w, d_fc2_b,
                     d_fc2_out,
+                    cur_batch,
                     FC2_IN, FC2_OUT
                 );
                 checkCudaErrors(cudaGetLastError());
@@ -404,7 +448,7 @@ std::vector<int> scnn_inference(
                     d_fc2_out,
                     d_if4_v,
                     d_if4_out,
-                    FC2_OUT,
+                    cur_batch * FC2_OUT,
                     1.0f
                 );
                 checkCudaErrors(cudaGetLastError());
@@ -412,11 +456,12 @@ std::vector<int> scnn_inference(
 
             // (10) fc3: [84] -> [10] (最终输出不再过 IF)
             {
-                int blocks_fc3 = (FC3_OUT + THREADS - 1) / THREADS;
-                linear_forward<<<blocks_fc3, THREADS>>>(
+                int blocks_fc3 = (cur_batch * FC3_OUT + THREADS - 1) / THREADS;
+                linear_forward_batch<<<blocks_fc3, THREADS>>>(
                     d_if4_out,
                     d_fc3_w, d_fc3_b,
                     d_fc3_out,
+                    cur_batch,
                     FC3_IN, FC3_OUT
                 );
                 checkCudaErrors(cudaGetLastError());
@@ -424,10 +469,11 @@ std::vector<int> scnn_inference(
 
             // (11) logits 累加：logits_sum += fc3_out
             {
-                int blocks = (FC3_OUT + THREADS - 1) / THREADS;
-                add_logits<<<blocks, THREADS>>>(
+                int blocks = (cur_batch * FC3_OUT + THREADS - 1) / THREADS;
+                add_logits_batch<<<blocks, THREADS>>>(
                     d_fc3_out,
                     d_logits_sum,
+                    cur_batch,
                     FC3_OUT
                 );
                 checkCudaErrors(cudaGetLastError());
@@ -438,24 +484,25 @@ std::vector<int> scnn_inference(
         checkCudaErrors(cudaMemcpy(
             h_logits.data(),
             d_logits_sum,
-            FC3_OUT * sizeof(float),
+            cur_batch * FC3_OUT * sizeof(float),
             cudaMemcpyDeviceToHost
         ));
-
-        int pred = 0;
-        float best = h_logits[0] / T;
-        for (int k = 1; k < FC3_OUT; ++k) {
-            float v = h_logits[k] / T;
-            if (v > best) {
-                best = v;
-                pred = k;
+        for (int n = 0; n < cur_batch; ++n) {
+            int pred = 0;
+            float best = h_logits[n * FC3_OUT] / T;
+            for (int k = 1; k < FC3_OUT; ++k) {
+                float v = h_logits[n * FC3_OUT + k] / T;
+                if (v > best) {
+                    best = v;
+                    pred = k;
+                }
             }
+            predictions.push_back(pred);
         }
-        predictions.push_back(pred);
     } // image loop
 
     // 释放中间 GPU 内存
-    cudaFree(d_input);
+    cudaFree(d_all_images);
 
     cudaFree(d_conv1_out);
     cudaFree(d_if1_v);
@@ -497,8 +544,8 @@ int main(int argc, char* argv[]) {
 	
     // Load test data
     // TODO "/../../.." +
-    auto images = read_mnist_images(dir +  "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
-    auto labels = read_mnist_labels(dir +  "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
+    auto images = read_mnist_images(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
+    auto labels = read_mnist_labels(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
     if (images.empty() || labels.empty()) return 1;
 
     // Load model parameters to host memory
@@ -754,5 +801,133 @@ __global__ void add_logits(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < num_classes) {
         logits_sum[i] += logits_t[i];
+    }
+}
+
+// in:  [N, C_in, H_in, W_in]
+// out: [N, C_out, H_out, W_out]
+__global__ void conv2d_forward_batch(
+    const float* __restrict__ in,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int N, int C_in, int H_in, int W_in,
+    int C_out,
+    int K, int stride, int padding
+){
+    int w_out = blockIdx.x * blockDim.x + threadIdx.x;
+    int h_out = blockIdx.y * blockDim.y + threadIdx.y;
+    int co_n  = blockIdx.z; // 合并了 batch 和 out_channel
+
+    int H_out = (H_in + 2 * padding - K) / stride + 1;
+    int W_out = (W_in + 2 * padding - K) / stride + 1;
+
+    int total_channels = N * C_out;
+    if (co_n >= total_channels || h_out >= H_out || w_out >= W_out) return;
+
+    int n  = co_n / C_out;   // batch index
+    int co = co_n % C_out;   // output channel index
+
+    float sum = b[co];
+
+    for (int ci = 0; ci < C_in; ++ci) {
+        for (int kh = 0; kh < K; ++kh) {
+            for (int kw = 0; kw < K; ++kw) {
+                int h_in = h_out * stride - padding + kh;
+                int w_in = w_out * stride - padding + kw;
+                if (h_in < 0 || h_in >= H_in || w_in < 0 || w_in >= W_in) continue;
+
+                int idx_in = ((n * C_in + ci) * H_in + h_in) * W_in + w_in;
+                int idx_w  = ((co * C_in + ci) * K + kh) * K + kw;
+
+                sum += in[idx_in] * w[idx_w];
+            }
+        }
+    }
+
+    int idx_out = ((n * C_out + co) * H_out + h_out) * W_out + w_out;
+    out[idx_out] = sum;
+}
+
+// in:  [N, C, H_in, W_in]
+// out: [N, C, H_out, W_out]
+__global__ void maxpool2d_forward_batch(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int N, int C, int H_in, int W_in,
+    int K, int stride
+){
+    int w_out = blockIdx.x * blockDim.x + threadIdx.x;
+    int h_out = blockIdx.y * blockDim.y + threadIdx.y;
+    int c_n   = blockIdx.z; // 合并 batch 和 channel
+
+    int H_out = (H_in - K) / stride + 1;
+    int W_out = (W_in - K) / stride + 1;
+
+    int total = N * C;
+    if (c_n >= total || h_out >= H_out || w_out >= W_out) return;
+
+    int n = c_n / C;
+    int c = c_n % C;
+
+    int h_start = h_out * stride;
+    int w_start = w_out * stride;
+
+    float max_val = -1e30f;
+    for (int kh = 0; kh < K; ++kh) {
+        for (int kw = 0; kw < K; ++kw) {
+            int h = h_start + kh;
+            int w = w_start + kw;
+            int idx_in = ((n * C + c) * H_in + h) * W_in + w;
+            float v = in[idx_in];
+            if (v > max_val) max_val = v;
+        }
+    }
+
+    int idx_out = ((n * C + c) * H_out + h_out) * W_out + w_out;
+    out[idx_out] = max_val;
+}
+
+// x: [N, in_features]
+// W: [out_features, in_features]
+// b: [out_features]
+// y: [N, out_features]
+__global__ void linear_forward_batch(
+    const float* __restrict__ x,
+    const float* __restrict__ W,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int N,
+    int in_features,
+    int out_features
+){
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * out_features;
+    if (idx >= total) return;
+
+    int n  = idx / out_features;
+    int o  = idx % out_features;
+
+    const float* x_row = x + n * in_features;
+    const float* w_row = W + o * in_features;
+
+    float sum = b[o];
+    for (int j = 0; j < in_features; ++j) {
+        sum += w_row[j] * x_row[j];
+    }
+    y[n * out_features + o] = sum;
+}
+
+// logits_sum[n, k] += logits_t[n, k]
+__global__ void add_logits_batch(
+    const float* __restrict__ logits_t,  // [N, num_classes]
+    float* __restrict__ logits_sum,      // [N, num_classes]
+    int N,
+    int num_classes
+){
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * num_classes;
+    if (idx < total) {
+        logits_sum[idx] += logits_t[idx];
     }
 }
