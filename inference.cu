@@ -37,14 +37,13 @@ __global__ void conv2d_forward_batch(
     int K, int stride, int padding
 );
 
-// 2D 最大池化：NCHW
-__global__ void maxpool2d_forward_batch(
-    const float* __restrict__ in,
-    float* __restrict__ out,
+// 1D 最大池化：NCHW
+__global__ void maxpool1d_forward_batch(
+    const float* in,
+    float* out,
     int N, int C, int H_in, int W_in,
     int K, int stride
 );
-
 // 全连接层 y = W x + b
 __global__ void linear_forward_batch(
     const float* __restrict__ x,
@@ -76,6 +75,8 @@ __global__ void fc3_and_accumulate_batch(
     float* __restrict__ logits_sum,   // [N,10]
     int N, int IN, int OUT            // IN=84, OUT=10
 );
+
+
 
 // ===================================================================================
 // Helper for CUDA Error Handling - DO NOT MODIFY BEGIN
@@ -300,13 +301,9 @@ std::vector<int> scnn_inference(
 
             // (3) pool1: [6,24,24] -> [6,12,12]
             {
-                dim3 block(16, 16);
-                dim3 grid(
-                    (P1_W + block.x - 1) / block.x,
-                    (P1_H + block.y - 1) / block.y,
-                    cur_batch * C1_OUT_C
-                );
-                maxpool2d_forward_batch<<<grid, block>>>(
+                int total = cur_batch * C1_OUT_C * P1_H * P1_W;
+                int blocks = (total + THREADS - 1) / THREADS;
+                maxpool1d_forward_batch<<<blocks, THREADS>>>(
                     d_if1_out,
                     d_pool1_out,
                     cur_batch, C1_OUT_C, C1_H, C1_W,
@@ -349,13 +346,9 @@ std::vector<int> scnn_inference(
 
             // (6) pool2: [16,8,8] -> [16,4,4]
             {
-                dim3 block(16, 16);
-                dim3 grid(
-                    (P2_W + block.x - 1) / block.x,
-                    (P2_H + block.y - 1) / block.y,
-                    cur_batch * C2_OUT_C
-                );
-                maxpool2d_forward_batch<<<grid, block>>>(
+                int total = cur_batch * C2_OUT_C * P2_H * P2_W;
+                int blocks = (total + THREADS - 1) / THREADS;
+                maxpool1d_forward_batch<<<blocks, THREADS>>>(
                     d_if2_out,
                     d_pool2_out,
                     cur_batch, C2_OUT_C, C2_H, C2_W,
@@ -639,41 +632,34 @@ __global__ void conv2d_forward_batch(
 
 // in:  [N, C, H_in, W_in]
 // out: [N, C, H_out, W_out]
-__global__ void maxpool2d_forward_batch(
-    const float* __restrict__ in,
-    float* __restrict__ out,
+__global__ void maxpool1d_forward_batch(
+    const float* in,
+    float* out,
     int N, int C, int H_in, int W_in,
     int K, int stride
 ){
-    int w_out = blockIdx.x * blockDim.x + threadIdx.x;
-    int h_out = blockIdx.y * blockDim.y + threadIdx.y;
-    int c_n   = blockIdx.z; // 合并 batch 和 channel
-
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int H_out = (H_in - K) / stride + 1;
     int W_out = (W_in - K) / stride + 1;
+    int total = N * C * H_out * W_out;
+    if (idx >= total) return;
 
-    int total = N * C;
-    if (c_n >= total || h_out >= H_out || w_out >= W_out) return;
-
-    int n = c_n / C;
-    int c = c_n % C;
-
-    int h_start = h_out * stride;
-    int w_start = w_out * stride;
+    int w_out = idx % W_out;
+    int h_out = (idx / W_out) % H_out;
+    int c     = (idx / (W_out * H_out)) % C;
+    int n     = idx / (W_out * H_out * C);
 
     float max_val = -1e30f;
-    for (int kh = 0; kh < K; ++kh) {
-        for (int kw = 0; kw < K; ++kw) {
-            int h = h_start + kh;
-            int w = w_start + kw;
-            int idx_in = ((n * C + c) * H_in + h) * W_in + w;
+    int h0 = h_out * stride, w0 = w_out * stride;
+    for(int kh=0; kh<K; ++kh)
+        for(int kw=0; kw<K; ++kw) {
+            int h = h0 + kh, w = w0 + kw;
+            int idx_in = ((n*C+c)*H_in + h)*W_in + w;
             float v = in[idx_in];
             if (v > max_val) max_val = v;
         }
-    }
 
-    int idx_out = ((n * C + c) * H_out + h_out) * W_out + w_out;
-    out[idx_out] = max_val;
+    out[idx] = max_val;
 }
 
 // x: [N, in_features]
