@@ -32,11 +32,12 @@ __global__ void ifnode_forward(
     float threshold                 // 阈值，一般 1.0f
 );
 
-// 1D 最大池化：NCHW
-__global__ void maxpool1d_forward_batch(
-    const float* in,
-    float* out,
-    int N, int C, int H_in, int W_in,
+// 最大池化：NCHW
+__global__ void maxpool2d_forward_batch_fast(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int N, int C,
+    int H_in, int W_in,
     int K, int stride
 );
 
@@ -310,13 +311,19 @@ std::vector<int> scnn_inference(
 
             // (3) pool1: [6,24,24] -> [6,12,12]
             {
-                int total = cur_batch * C1_OUT_C * P1_H * P1_W;
-                int blocks = (total + THREADS - 1) / THREADS;
-                maxpool1d_forward_batch<<<blocks, THREADS>>>(
-                    d_if1_out,
-                    d_pool1_out,
-                    cur_batch, C1_OUT_C, C1_H, C1_W,
-                    P1_K, P1_STR
+                dim3 block(16, 16);  // 每个 block 覆盖 16x16 个 (h_out, w_out)
+                dim3 grid(
+                    (P1_W + block.x - 1) / block.x,  // P1_W = 12
+                    (P1_H + block.y - 1) / block.y,  // P1_H = 12
+                    cur_batch * C1_OUT_C             // 合并 N 和 C
+                );
+
+                maxpool2d_forward_batch_fast<<<grid, block>>>(
+                    d_if1_out,    // in:  [cur_batch, 6, 24, 24]
+                    d_pool1_out,  // out: [cur_batch, 6, 12, 12]
+                    cur_batch, C1_OUT_C,
+                    C1_H, C1_W,
+                    P1_K, P1_STR  // K=2, stride=2
                 );
                 checkCudaErrors(cudaGetLastError());
             }
@@ -362,13 +369,19 @@ std::vector<int> scnn_inference(
 
             // (6) pool2: [16,8,8] -> [16,4,4]
             {
-                int total = cur_batch * C2_OUT_C * P2_H * P2_W;
-                int blocks = (total + THREADS - 1) / THREADS;
-                maxpool1d_forward_batch<<<blocks, THREADS>>>(
-                    d_if2_out,
-                    d_pool2_out,
-                    cur_batch, C2_OUT_C, C2_H, C2_W,
-                    P2_K, P2_STR
+                dim3 block(16, 16);
+                dim3 grid(
+                    (P2_W + block.x - 1) / block.x,  // P2_W = 4
+                    (P2_H + block.y - 1) / block.y,  // P2_H = 4
+                    cur_batch * C2_OUT_C             // 合并 N 和 C
+                );
+
+                maxpool2d_forward_batch_fast<<<grid, block>>>(
+                    d_if2_out,    // in:  [cur_batch, 16, 8, 8]
+                    d_pool2_out,  // out: [cur_batch, 16, 4, 4]
+                    cur_batch, C2_OUT_C,
+                    C2_H, C2_W,   // H_in=8, W_in=8
+                    P2_K, P2_STR  // K=2, stride=2
                 );
                 checkCudaErrors(cudaGetLastError());
             }
@@ -624,34 +637,57 @@ __global__ void ifnode_forward(
 
 // in:  [N, C, H_in, W_in]
 // out: [N, C, H_out, W_out]
-__global__ void maxpool1d_forward_batch(
-    const float* in,
-    float* out,
-    int N, int C, int H_in, int W_in,
+// H_out = (H_in - K) / stride + 1
+// W_out = (W_in - K) / stride + 1
+__global__ void maxpool2d_forward_batch_fast(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int N, int C,
+    int H_in, int W_in,
     int K, int stride
 ){
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int w_out = blockIdx.x * blockDim.x + threadIdx.x;
+    int h_out = blockIdx.y * blockDim.y + threadIdx.y;
+    int nc    = blockIdx.z;   // 合并 N 和 C
+
     int H_out = (H_in - K) / stride + 1;
     int W_out = (W_in - K) / stride + 1;
-    int total = N * C * H_out * W_out;
-    if (idx >= total) return;
 
-    int w_out = idx % W_out;
-    int h_out = (idx / W_out) % H_out;
-    int c     = (idx / (W_out * H_out)) % C;
-    int n     = idx / (W_out * H_out * C);
+    if (w_out >= W_out || h_out >= H_out || nc >= N * C) return;
+
+    int n = nc / C;
+    int c = nc % C;
+
+    int h0 = h_out * stride;
+    int w0 = w_out * stride;
+
+    // 输入 feature map 的这一块左上角在 global 内存中的 index
+    int idx_base_in = ((n * C + c) * H_in + h0) * W_in + w0;
 
     float max_val = -1e30f;
-    int h0 = h_out * stride, w0 = w_out * stride;
-    for(int kh=0; kh<K; ++kh)
-        for(int kw=0; kw<K; ++kw) {
-            int h = h0 + kh, w = w0 + kw;
-            int idx_in = ((n*C+c)*H_in + h)*W_in + w;
-            float v = in[idx_in];
-            if (v > max_val) max_val = v;
-        }
 
-    out[idx] = max_val;
+    if (K == 2 && stride == 2) {
+        // 为 K=2, stride=2 做展开优化（你的 LeNet 就是这种）
+        float v00 = in[idx_base_in];
+        float v01 = in[idx_base_in + 1];
+        float v10 = in[idx_base_in + W_in];
+        float v11 = in[idx_base_in + W_in + 1];
+        max_val = fmaxf(fmaxf(v00, v01), fmaxf(v10, v11));
+    } else {
+        // 通用版本（应对其他 K/stride）
+        for (int kh = 0; kh < K; ++kh) {
+            int h = h0 + kh;
+            int row_base = ((n * C + c) * H_in + h) * W_in;
+            for (int kw = 0; kw < K; ++kw) {
+                int w = w0 + kw;
+                float v = in[row_base + w];
+                if (v > max_val) max_val = v;
+            }
+        }
+    }
+
+    int idx_out = ((n * C + c) * H_out + h_out) * W_out + w_out;
+    out[idx_out] = max_val;
 }
 
 // x:  [N, in_features]
