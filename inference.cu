@@ -7,7 +7,6 @@
 #include <numeric>
 #include <algorithm>
 
-// TODO
 /**/
 __device__ __host__ uint32_t __builtin_bswap32(uint32_t val) {
     return ((val & 0x000000FF) << 24) |
@@ -15,6 +14,13 @@ __device__ __host__ uint32_t __builtin_bswap32(uint32_t val) {
            ((val & 0x00FF0000) >> 8) |
            ((val & 0xFF000000) >> 24);
 }
+
+// conv1: 1x28x28 -> 6x24x24, K=5
+// 权重： [C_out, C_in, K, K] = [6, 1, 5, 5] 共 150 个 float
+__constant__ float d_conv1_w_const[6 * 1 * 5 * 5];
+__constant__ float d_conv1_b_const[6];
+__constant__ float d_conv2_w_const[16 * 6 * 5 * 5];
+__constant__ float d_conv2_b_const[16];
 
 
 // IF 脉冲神经元：逐元素更新膜电位并生成 0/1 脉冲
@@ -26,17 +32,6 @@ __global__ void ifnode_forward(
     float threshold                 // 阈值，一般 1.0f
 );
 
-// 多通道 2D 卷积：输入/输出都是 NCHW
-__global__ void conv2d_forward_batch(
-    const float* __restrict__ in,
-    const float* __restrict__ w,
-    const float* __restrict__ b,
-    float* __restrict__ out,
-    int N, int C_in, int H_in, int W_in,
-    int C_out,
-    int K, int stride, int padding
-);
-
 // 1D 最大池化：NCHW
 __global__ void maxpool1d_forward_batch(
     const float* in,
@@ -44,17 +39,8 @@ __global__ void maxpool1d_forward_batch(
     int N, int C, int H_in, int W_in,
     int K, int stride
 );
-// 全连接层 y = W x + b
-__global__ void linear_forward_batch(
-    const float* __restrict__ x,
-    const float* __restrict__ W,
-    const float* __restrict__ b,
-    float* __restrict__ y,
-    int N,
-    int in_features,
-    int out_features
-);
 
+// 全连接层 y = W x + b
 __global__ void fc_if_forward_batch(
     const float* __restrict__ x,
     const float* __restrict__ W,
@@ -76,7 +62,23 @@ __global__ void fc3_and_accumulate_batch(
     int N, int IN, int OUT            // IN=84, OUT=10
 );
 
+template<int BLOCK_H, int BLOCK_W>
+__global__ void conv1_forward_shared_const(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int N,
+    int H_in,
+    int W_in
+);
 
+template<int BLOCK_H, int BLOCK_W>
+__global__ void conv2_forward_shared_const(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int N,
+    int H_in,
+    int W_in
+);
 
 // ===================================================================================
 // Helper for CUDA Error Handling - DO NOT MODIFY BEGIN
@@ -267,20 +269,27 @@ std::vector<int> scnn_inference(
 
         // (1) conv1: [1,28,28] -> [6,24,24]
         {
-            dim3 block(16, 16);
+            constexpr int BLOCK_H = 16;
+            constexpr int BLOCK_W = 16;
+
+            dim3 block(BLOCK_W, BLOCK_H);
             dim3 grid(
-                (C1_W + block.x - 1) / block.x,
-                (C1_H + block.y - 1) / block.y,
-                cur_batch * C1_OUT_C
+                (C1_W + BLOCK_W - 1) / BLOCK_W, // C1_W=24
+                (C1_H + BLOCK_H - 1) / BLOCK_H, // C1_H=24
+                cur_batch * C1_OUT_C            // 6
             );
-            conv2d_forward_batch<<<grid, block>>>(
-                d_input,
-                d_conv1_w, d_conv1_b,
-                d_conv1_out,
-                cur_batch, C1_IN_C, IMG_H, IMG_W,
-                C1_OUT_C,
-                C1_K, C1_STR, C1_PAD
-            );
+
+            size_t shared_bytes =
+                C1_IN_C * (BLOCK_H + C1_K - 1) * (BLOCK_W + C1_K - 1) * sizeof(float);
+            // = 1 * 20 * 20 = 400 float ≈ 1.6KB
+
+            conv1_forward_shared_const<BLOCK_H, BLOCK_W>
+                <<<grid, block, shared_bytes>>>(
+                    d_input,       // [cur_batch,1,28,28]
+                    d_conv1_out,   // [cur_batch,6,24,24]
+                    cur_batch,
+                    IMG_H, IMG_W
+                );
             checkCudaErrors(cudaGetLastError());
         }
         // 在 T 个时间步上循环
@@ -314,20 +323,27 @@ std::vector<int> scnn_inference(
 
             // (4) conv2: [6,12,12] -> [16,8,8]
             {
-                dim3 block(16, 16);
+                constexpr int BLOCK_H = 8;
+                constexpr int BLOCK_W = 8;
+
+                dim3 block(BLOCK_W, BLOCK_H);
                 dim3 grid(
-                    (C2_W + block.x - 1) / block.x,
-                    (C2_H + block.y - 1) / block.y,
-                    cur_batch * C2_OUT_C
+                    (C2_W + BLOCK_W - 1) / BLOCK_W, // C2_W=8
+                    (C2_H + BLOCK_H - 1) / BLOCK_H, // C2_H=8
+                    cur_batch * C2_OUT_C            // 16
                 );
-                conv2d_forward_batch<<<grid, block>>>(
-                    d_pool1_out,
-                    d_conv2_w, d_conv2_b,
-                    d_conv2_out,
-                    cur_batch, C2_IN_C, P1_H, P1_W,
-                    C2_OUT_C,
-                    C2_K, C2_STR, C2_PAD
-                );
+
+                size_t shared_bytes =
+                    C2_IN_C * (BLOCK_H + C2_K - 1) * (BLOCK_W + C2_K - 1) * sizeof(float);
+                // = 6 * 12 * 12 = 864 float ≈ 3.4KB
+
+                conv2_forward_shared_const<BLOCK_H, BLOCK_W>
+                    <<<grid, block, shared_bytes>>>(
+                        d_pool1_out,   // [cur_batch,6,12,12]
+                        d_conv2_out,   // [cur_batch,16,8,8]
+                        cur_batch,
+                        P1_H, P1_W     // 12, 12
+                    );
                 checkCudaErrors(cudaGetLastError());
             }
 
@@ -513,6 +529,27 @@ int main(int argc, char* argv[]) {
 // Main Function -  DO NOT MODIFY END
 // ===================================================================================
 
+    // 拷贝到 constant memory
+    checkCudaErrors(cudaMemcpyToSymbol(
+        d_conv1_w_const,
+        conv1_w.data(),
+        conv1_w.size() * sizeof(float),
+        0, cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpyToSymbol(
+        d_conv1_b_const,
+        conv1_b.data(),
+        conv1_b.size() * sizeof(float),
+        0, cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpyToSymbol(
+        d_conv2_w_const, conv2_w.data(),
+        conv2_w.size() * sizeof(float),
+        0, cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpyToSymbol(
+        d_conv2_b_const, conv2_b.data(),
+        conv2_b.size() * sizeof(float),
+        0, cudaMemcpyHostToDevice));
+
+
     // --- 3. Perform inference ---
     // Pass device pointers to the inference function
     std::vector<int> predictions = scnn_inference(images,
@@ -585,51 +622,6 @@ __global__ void ifnode_forward(
     }
 }
 
-// in:  [N, C_in, H_in, W_in]
-// out: [N, C_out, H_out, W_out]
-__global__ void conv2d_forward_batch(
-    const float* __restrict__ in,
-    const float* __restrict__ w,
-    const float* __restrict__ b,
-    float* __restrict__ out,
-    int N, int C_in, int H_in, int W_in,
-    int C_out,
-    int K, int stride, int padding
-){
-    int w_out = blockIdx.x * blockDim.x + threadIdx.x;
-    int h_out = blockIdx.y * blockDim.y + threadIdx.y;
-    int co_n  = blockIdx.z; // 合并了 batch 和 out_channel
-
-    int H_out = (H_in + 2 * padding - K) / stride + 1;
-    int W_out = (W_in + 2 * padding - K) / stride + 1;
-
-    int total_channels = N * C_out;
-    if (co_n >= total_channels || h_out >= H_out || w_out >= W_out) return;
-
-    int n  = co_n / C_out;   // batch index
-    int co = co_n % C_out;   // output channel index
-
-    float sum = b[co];
-
-    for (int ci = 0; ci < C_in; ++ci) {
-        for (int kh = 0; kh < K; ++kh) {
-            for (int kw = 0; kw < K; ++kw) {
-                int h_in = h_out * stride - padding + kh;
-                int w_in = w_out * stride - padding + kw;
-                if (h_in < 0 || h_in >= H_in || w_in < 0 || w_in >= W_in) continue;
-
-                int idx_in = ((n * C_in + ci) * H_in + h_in) * W_in + w_in;
-                int idx_w  = ((co * C_in + ci) * K + kh) * K + kw;
-
-                sum += in[idx_in] * w[idx_w];
-            }
-        }
-    }
-
-    int idx_out = ((n * C_out + co) * H_out + h_out) * W_out + w_out;
-    out[idx_out] = sum;
-}
-
 // in:  [N, C, H_in, W_in]
 // out: [N, C, H_out, W_out]
 __global__ void maxpool1d_forward_batch(
@@ -660,36 +652,6 @@ __global__ void maxpool1d_forward_batch(
         }
 
     out[idx] = max_val;
-}
-
-// x: [N, in_features]
-// W: [out_features, in_features]
-// b: [out_features]
-// y: [N, out_features]
-__global__ void linear_forward_batch(
-    const float* __restrict__ x,
-    const float* __restrict__ W,
-    const float* __restrict__ b,
-    float* __restrict__ y,
-    int N,
-    int in_features,
-    int out_features
-){
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = N * out_features;
-    if (idx >= total) return;
-
-    int n  = idx / out_features;
-    int o  = idx % out_features;
-
-    const float* x_row = x + n * in_features;
-    const float* w_row = W + o * in_features;
-
-    float sum = b[o];
-    for (int j = 0; j < in_features; ++j) {
-        sum += w_row[j] * x_row[j];
-    }
-    y[n * out_features + o] = sum;
 }
 
 // x:  [N, in_features]
@@ -759,4 +721,150 @@ __global__ void fc3_and_accumulate_batch(
         sum += w_row[j] * x_row[j];
 
     logits_sum[idx] += sum;
+}
+
+// 通用 shared-memory 卷积 core
+// in:  [N, C_IN, H_in, W_in]
+// w:   [C_OUT, C_IN, K, K]
+// b:   [C_OUT]
+// out: [N, C_OUT, H_out, W_out]
+template<
+    int C_IN,
+    int C_OUT,
+    int K,
+    int STRIDE,
+    int PADDING,
+    int BLOCK_H,
+    int BLOCK_W
+>
+__device__ void conv_shared_core(
+    const float* __restrict__ in,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    float* __restrict__ s_in,  // shared memory: [C_IN, TILE_H, TILE_W]
+    int N,
+    int H_in,
+    int W_in
+){
+    int H_out = (H_in + 2 * PADDING - K) / STRIDE + 1;
+    int W_out = (W_in + 2 * PADDING - K) / STRIDE + 1;
+
+    int out_w0 = blockIdx.x * BLOCK_W;
+    int out_h0 = blockIdx.y * BLOCK_H;
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int co_n = blockIdx.z;
+    int n  = co_n / C_OUT;
+    int co = co_n % C_OUT;
+    if (n >= N) return;
+
+    constexpr int TILE_H = BLOCK_H + K - 1;
+    constexpr int TILE_W = BLOCK_W + K - 1;
+
+    // -------- 1. load 输入 patch -> shared memory --------
+    for (int ci = 0; ci < C_IN; ++ci) {
+        for (int th = ty; th < TILE_H; th += BLOCK_H) {
+            int h_in = out_h0 * STRIDE - PADDING + th;
+
+            for (int tw = tx; tw < TILE_W; tw += BLOCK_W) {
+                int w_in = out_w0 * STRIDE - PADDING + tw;
+
+                float val = 0.0f;
+                if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
+                    int idx_in = ((n * C_IN + ci) * H_in + h_in) * W_in + w_in;
+                    val = in[idx_in];
+                }
+
+                int idx_s = (ci * TILE_H + th) * TILE_W + tw;
+                s_in[idx_s] = val;
+            }
+        }
+    }
+
+    __syncthreads();
+
+    // -------- 2. 每个 thread 计算一个输出像素 --------
+    int h_out = out_h0 + ty;
+    int w_out = out_w0 + tx;
+    if (h_out >= H_out || w_out >= W_out) return;
+
+    float sum = b[co];
+    int w_base_co = co * (C_IN * K * K);
+
+    #pragma unroll
+    for (int ci = 0; ci < C_IN; ++ci) {
+        int w_base_ci = w_base_co + ci * (K * K);
+
+        #pragma unroll
+        for (int kh = 0; kh < K; ++kh) {
+            int th = ty + kh;
+
+            #pragma unroll
+            for (int kw = 0; kw < K; ++kw) {
+                int tw = tx + kw;
+
+                int idx_s = (ci * TILE_H + th) * TILE_W + tw;
+                float vin = s_in[idx_s];
+
+                int idx_w = w_base_ci + kh * K + kw;
+                float ww  = w[idx_w];
+
+                sum += vin * ww;
+            }
+        }
+    }
+
+    int idx_out = ((n * C_OUT + co) * H_out + h_out) * W_out + w_out;
+    out[idx_out] = sum;
+}
+
+// conv1: 1x28x28 -> 6x24x24
+template<int BLOCK_H, int BLOCK_W>
+__global__ void conv1_forward_shared_const(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int N,
+    int H_in,
+    int W_in
+){
+    // shared memory: [C_IN=1, TILE_H, TILE_W]
+    extern __shared__ float s_mem[];
+
+    conv_shared_core<
+        1, 6,        // C_IN, C_OUT
+        5, 1, 0,     // K, STRIDE, PADDING
+        BLOCK_H, BLOCK_W
+    >(in,
+      d_conv1_w_const,   // constant 权重
+      d_conv1_b_const,   // constant 偏置
+      out,
+      s_mem,
+      N, H_in, W_in);
+}
+
+// conv2: 6x12x12 -> 16x8x8
+template<int BLOCK_H, int BLOCK_W>
+__global__ void conv2_forward_shared_const(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int N,
+    int H_in,
+    int W_in
+){
+    // shared memory: [C_IN=6, TILE_H, TILE_W]
+    extern __shared__ float s_mem[];
+
+    conv_shared_core<
+        6, 16,       // C_IN, C_OUT
+        5, 1, 0,     // K, STRIDE, PADDING
+        BLOCK_H, BLOCK_W
+    >(in,
+      d_conv2_w_const,
+      d_conv2_b_const,
+      out,
+      s_mem,
+      N, H_in, W_in);
 }
