@@ -7,81 +7,76 @@
 #include <numeric>
 #include <algorithm>
 
-/*
+/**/
 __device__ __host__ uint32_t __builtin_bswap32(uint32_t val) {
     return ((val & 0x000000FF) << 24) |
            ((val & 0x0000FF00) << 8) |
            ((val & 0x00FF0000) >> 8) |
            ((val & 0xFF000000) >> 24);
-}*/
+}
 
-// conv1: 1x28x28 -> 6x24x24, K=5
-// 权重： [C_out, C_in, K, K] = [6, 1, 5, 5] 共 150 个 float
 __constant__ float d_conv1_w_const[6 * 1 * 5 * 5];
 __constant__ float d_conv1_b_const[6];
 __constant__ float d_conv2_w_const[16 * 6 * 5 * 5];
 __constant__ float d_conv2_b_const[16];
 
+// SNN-specific parameter, must match training
+const int T = 8;
+const int BATCH = 512;
+// 输入尺寸
+const int IMG_C = 1;
+const int IMG_H = 28;
+const int IMG_W = 28;
+// conv1: 1x28x28 -> 6x24x24 (K=5, S=1, P=0)
+const int C1_IN_C  = 1;
+const int C1_OUT_C = 6;
+const int C1_K     = 5;
+const int C1_STR   = 1;
+const int C1_PAD   = 0;
+const int C1_H     = (IMG_H + 2*C1_PAD - C1_K) / C1_STR + 1; // 24
+const int C1_W     = (IMG_W + 2*C1_PAD - C1_K) / C1_STR + 1; // 24
+const int C1_N     = C1_OUT_C * C1_H * C1_W;
+// pool1: 2x2, stride=2 -> 6x12x12
+const int P1_K   = 2;
+const int P1_STR = 2;
+const int P1_H   = C1_H / 2; // 12
+const int P1_W   = C1_W / 2; // 12
+const int P1_N   = C1_OUT_C * P1_H * P1_W;  // 通道数不变
+// conv2: 6x12x12 -> 16x8x8 (K=5)
+const int C2_IN_C  = 6;
+const int C2_OUT_C = 16;
+const int C2_K     = 5;
+const int C2_STR   = 1;
+const int C2_PAD   = 0;
+const int C2_H     = (P1_H + 2*C2_PAD - C2_K) / C2_STR + 1; // 8
+const int C2_W     = (P1_W + 2*C2_PAD - C2_K) / C2_STR + 1; // 8
+const int C2_N     = C2_OUT_C * C2_H * C2_W;
+// pool2: 2x2 -> 16x4x4
+const int P2_K   = 2;
+const int P2_STR = 2;
+const int P2_H   = C2_H / 2; // 4
+const int P2_W   = C2_W / 2; // 4
+const int P2_N   = C2_OUT_C * P2_H * P2_W; // 16*4*4 = 256
+// 全连接层尺寸
+const int FC1_IN  = P2_N;   // 256
+const int FC1_OUT = 120;
+const int FC2_IN  = FC1_OUT;
+const int FC2_OUT = 84;
+const int FC3_IN  = FC2_OUT;
+const int FC3_OUT = 10;
 
-// IF 脉冲神经元：逐元素更新膜电位并生成 0/1 脉冲
-__global__ void ifnode_forward(
-    const float* __restrict__ in,   // 输入电流
-    float* __restrict__ v,          // 膜电位（需要跨时间步保留）
-    float* __restrict__ out,        // 脉冲输出 0/1
-    int N,                          // 元素总数
-    float threshold                 // 阈值，一般 1.0f
-);
+// kernel 启动配置（简单用 1D 配置，conv/pool 自己在实现里用 3D 也可以）
+const int THREADS = 128;
 
-// 最大池化：NCHW
-__global__ void maxpool2d_forward_batch_fast(
-    const float* __restrict__ in,
-    float* __restrict__ out,
-    int N, int C,
-    int H_in, int W_in,
-    int K, int stride
-);
-
-// 全连接层 y = W x + b
-__global__ void fc_if_forward_batch(
-    const float* __restrict__ x,
-    const float* __restrict__ W,
-    const float* __restrict__ b,
-    float* __restrict__ v,
-    float* __restrict__ out,
-    int N,
-    int in_features,
-    int out_features,
-    float threshold
-);
-
-// 把当前时间步的 logits 累加到 logits_sum 上： logits_sum += logits_t
-__global__ void fc3_and_accumulate_batch(
-    const float* __restrict__ x,      // [N,84]
-    const float* __restrict__ W,      // [10,84]
-    const float* __restrict__ b,      // [10]
-    float* __restrict__ logits_sum,   // [N,10]
-    int N, int IN, int OUT            // IN=84, OUT=10
-);
-
-template<int BLOCK_H, int BLOCK_W>
-__global__ void conv1_forward_shared_const(
-    const float* __restrict__ in,
-    float* __restrict__ out,
-    int N,
-    int H_in,
-    int W_in
-);
-
-template<int BLOCK_H, int BLOCK_W>
-__global__ void conv2_if2_forward_shared_const(
-    const float* __restrict__ in,
-    float* __restrict__ v,          // IF2膜电位
-    float* __restrict__ out,        // IF2输出
-    int N,
-    int H_in,
-    int W_in,
-    float threshold
-);
+void process_batch(
+    cudaStream_t stream,
+    const float* d_input, int cur_batch,
+    float* d_conv1_out, float* d_if1_v, float* d_if1_out,
+    float* d_pool1_out, float* d_if2_v, float* d_if2_out, 
+    float* d_pool2_out, float* d_if3_v, float* d_if3_out,
+    float* d_if4_v, float* d_if4_out, float* d_logits_sum,
+    float* d_fc1_w,   float* d_fc1_b,   float* d_fc2_w,   float* d_fc2_b,
+    float* d_fc3_w,   float* d_fc3_b);
 
 // ===================================================================================
 // Helper for CUDA Error Handling - DO NOT MODIFY BEGIN
@@ -159,54 +154,14 @@ std::vector<int> scnn_inference(
     const int num_images = images.size();
     predictions.reserve(num_images);
 
-    // SNN-specific parameter, must match training
-    const int T = 8;
-    const int BATCH = 512;
-    // 输入尺寸
-    const int IMG_C = 1;
-    const int IMG_H = 28;
-    const int IMG_W = 28;
-    // conv1: 1x28x28 -> 6x24x24 (K=5, S=1, P=0)
-    const int C1_IN_C  = 1;
-    const int C1_OUT_C = 6;
-    const int C1_K     = 5;
-    const int C1_STR   = 1;
-    const int C1_PAD   = 0;
-    const int C1_H     = (IMG_H + 2*C1_PAD - C1_K) / C1_STR + 1; // 24
-    const int C1_W     = (IMG_W + 2*C1_PAD - C1_K) / C1_STR + 1; // 24
-    const int C1_N     = C1_OUT_C * C1_H * C1_W;
-    // pool1: 2x2, stride=2 -> 6x12x12
-    const int P1_K   = 2;
-    const int P1_STR = 2;
-    const int P1_H   = C1_H / 2; // 12
-    const int P1_W   = C1_W / 2; // 12
-    const int P1_N   = C1_OUT_C * P1_H * P1_W;  // 通道数不变
-    // conv2: 6x12x12 -> 16x8x8 (K=5)
-    const int C2_IN_C  = 6;
-    const int C2_OUT_C = 16;
-    const int C2_K     = 5;
-    const int C2_STR   = 1;
-    const int C2_PAD   = 0;
-    const int C2_H     = (P1_H + 2*C2_PAD - C2_K) / C2_STR + 1; // 8
-    const int C2_W     = (P1_W + 2*C2_PAD - C2_K) / C2_STR + 1; // 8
-    const int C2_N     = C2_OUT_C * C2_H * C2_W;
-    // pool2: 2x2 -> 16x4x4
-    const int P2_K   = 2;
-    const int P2_STR = 2;
-    const int P2_H   = C2_H / 2; // 4
-    const int P2_W   = C2_W / 2; // 4
-    const int P2_N   = C2_OUT_C * P2_H * P2_W; // 16*4*4 = 256
-    // 全连接层尺寸
-    const int FC1_IN  = P2_N;   // 256
-    const int FC1_OUT = 120;
-    const int FC2_IN  = FC1_OUT;
-    const int FC2_OUT = 84;
-    const int FC3_IN  = FC2_OUT;
-    const int FC3_OUT = 10;
+    cudaStream_t stream1, stream2;
+    cudaStreamCreate(&stream1);
+    cudaStreamCreate(&stream2);
 
     // 分配中间特征图和膜电位的 GPU 缓冲区
     // conv1 / IF1 / pool1
-    float *d_conv1_out = nullptr, *d_if1_v = nullptr, *d_if1_out = nullptr;
+    float *d_conv1_out = nullptr;
+    float *d_if1_v = nullptr, *d_if1_out = nullptr;
     float *d_pool1_out = nullptr;
     cudaMalloc(&d_conv1_out, BATCH * C1_N * sizeof(float));
     cudaMalloc(&d_if1_v, BATCH * C1_N * sizeof(float));
@@ -230,11 +185,30 @@ std::vector<int> scnn_inference(
     // logits 累积缓冲区
     float* d_logits_sum = nullptr;
     cudaMalloc(&d_logits_sum, BATCH * FC3_OUT * sizeof(float));
+
+    float *d_conv1_out_2 = nullptr;
+    float *d_if1_v_2 = nullptr, *d_if1_out_2 = nullptr;
+    float *d_pool1_out_2 = nullptr;
+    cudaMalloc(&d_conv1_out_2, BATCH * C1_N * sizeof(float));
+    cudaMalloc(&d_if1_v_2, BATCH * C1_N * sizeof(float));
+    cudaMalloc(&d_if1_out_2, BATCH * C1_N * sizeof(float));
+    cudaMalloc(&d_pool1_out_2, BATCH * P1_N * sizeof(float));
+    float *d_if2_v_2 = nullptr, *d_if2_out_2 = nullptr;
+    float *d_pool2_out_2 = nullptr;
+    cudaMalloc(&d_if2_v_2, BATCH * C2_N * sizeof(float));
+    cudaMalloc(&d_if2_out_2, BATCH * C2_N * sizeof(float));
+    cudaMalloc(&d_pool2_out_2, BATCH * P2_N * sizeof(float));
+    float *d_if3_v_2 = nullptr, *d_if3_out_2 = nullptr;
+    cudaMalloc(&d_if3_v_2, BATCH * FC1_OUT * sizeof(float));
+    cudaMalloc(&d_if3_out_2, BATCH * FC1_OUT * sizeof(float));
+    float *d_if4_v_2 = nullptr, *d_if4_out_2 = nullptr;
+    cudaMalloc(&d_if4_v_2, BATCH * FC2_OUT * sizeof(float));
+    cudaMalloc(&d_if4_out_2, BATCH * FC2_OUT * sizeof(float));
+    float* d_logits_sum_2 = nullptr;
+    cudaMalloc(&d_logits_sum_2, BATCH * FC3_OUT * sizeof(float));
+
     // host 端读取 logits 用于 argmax
     std::vector<float> h_logits(BATCH * FC3_OUT);
-
-    // kernel 启动配置（简单用 1D 配置，conv/pool 自己在实现里用 3D 也可以）
-    const int THREADS = 128;
 
     std::vector<float> h_all_images(num_images * IMG_C * IMG_H * IMG_W);
     for (int i = 0; i < num_images; ++i) {
@@ -256,7 +230,7 @@ std::vector<int> scnn_inference(
     ));
 
     // --- Loop over each image ---
-    for (int base = 0; base < num_images; base += BATCH) {
+    for (int base = 0; base < num_images; base += BATCH * 2) {
         int cur_batch = std::min(BATCH, num_images - base);
         // images[i] 大小是 28*28
         const float* d_input = d_all_images + base * IMG_C * IMG_H * IMG_W;
@@ -269,159 +243,39 @@ std::vector<int> scnn_inference(
         // logits_sum 清零
         cudaMemset(d_logits_sum, 0, cur_batch * FC3_OUT * sizeof(float));
 
-        // (1) conv1: [1,28,28] -> [6,24,24]
+        // 流1: 处理第一个batch
+        process_batch(stream1, d_input, cur_batch, 
+                    d_conv1_out, d_if1_v, d_if1_out, 
+                    d_pool1_out, d_if2_v, d_if2_out,
+                    d_pool2_out, d_if3_v, d_if3_out,
+                    d_if4_v, d_if4_out, d_logits_sum,
+                    d_fc1_w, d_fc1_b, d_fc2_w, d_fc2_b,
+                    d_fc3_w, d_fc3_b);
+
+        int cur_batch_2 = std::min(BATCH, num_images - base - BATCH);
+        if(cur_batch_2 > 0)
         {
-            constexpr int BLOCK_H = 16;
-            constexpr int BLOCK_W = 16;
-
-            dim3 block(BLOCK_W, BLOCK_H);
-            dim3 grid(
-                (C1_W + BLOCK_W - 1) / BLOCK_W, // C1_W=24
-                (C1_H + BLOCK_H - 1) / BLOCK_H, // C1_H=24
-                cur_batch * C1_OUT_C            // 6
-            );
-
-            size_t shared_bytes =
-                C1_IN_C * (BLOCK_H + C1_K - 1) * (BLOCK_W + C1_K - 1) * sizeof(float);
-            // = 1 * 20 * 20 = 400 float ≈ 1.6KB
-
-            conv1_forward_shared_const<BLOCK_H, BLOCK_W>
-                <<<grid, block, shared_bytes>>>(
-                    d_input,       // [cur_batch,1,28,28]
-                    d_conv1_out,   // [cur_batch,6,24,24]
-                    cur_batch,
-                    IMG_H, IMG_W
-                );
-            checkCudaErrors(cudaGetLastError());
-        }
-        // 在 T 个时间步上循环
-        for (int t = 0; t < T; ++t) {
+            const float* d_input_2 = d_all_images + (base + BATCH) * IMG_C * IMG_H * IMG_W;
             
-            // (2) IF1: conv1_out -> if1_out (0/1)，更新 d_if1_v
-            {
-                int blocks = (cur_batch * C1_N + THREADS - 1) / THREADS;
-                ifnode_forward<<<blocks, THREADS>>>(
-                    d_conv1_out,
-                    d_if1_v,
-                    d_if1_out,
-                    cur_batch * C1_N,
-                    1.0f
-                );
-                checkCudaErrors(cudaGetLastError());
-            }
+            // 把所有 IF 膜电位清零
+            cudaMemset(d_if1_v_2, 0, cur_batch_2 * C1_N * sizeof(float));
+            cudaMemset(d_if2_v_2, 0, cur_batch_2 * C2_N * sizeof(float));
+            cudaMemset(d_if3_v_2, 0, cur_batch_2 * FC1_OUT * sizeof(float));
+            cudaMemset(d_if4_v_2, 0, cur_batch_2 * FC2_OUT * sizeof(float));
+            // logits_sum 清零
+            cudaMemset(d_logits_sum_2, 0, cur_batch_2 * FC3_OUT * sizeof(float));
 
-            // (3) pool1: [6,24,24] -> [6,12,12]
-            {
-                dim3 block(16, 16);  // 每个 block 覆盖 16x16 个 (h_out, w_out)
-                dim3 grid(
-                    (P1_W + block.x - 1) / block.x,  // P1_W = 12
-                    (P1_H + block.y - 1) / block.y,  // P1_H = 12
-                    cur_batch * C1_OUT_C             // 合并 N 和 C
-                );
-
-                maxpool2d_forward_batch_fast<<<grid, block>>>(
-                    d_if1_out,    // in:  [cur_batch, 6, 24, 24]
-                    d_pool1_out,  // out: [cur_batch, 6, 12, 12]
-                    cur_batch, C1_OUT_C,
-                    C1_H, C1_W,
-                    P1_K, P1_STR  // K=2, stride=2
-                );
-                checkCudaErrors(cudaGetLastError());
-            }
-
-            // (4+5) 融合 conv2 + IF2: [6,12,12] -> [16,8,8] -> IF脉冲
-            {
-                constexpr int BLOCK_H = 8;
-                constexpr int BLOCK_W = 8;
-
-                dim3 block(BLOCK_W, BLOCK_H);
-                dim3 grid(
-                    (C2_W + BLOCK_W - 1) / BLOCK_W, // C2_W=8
-                    (C2_H + BLOCK_H - 1) / BLOCK_H, // C2_H=8
-                    cur_batch * C2_OUT_C            // 16
-                );
-
-                size_t shared_bytes =
-                    C2_IN_C * (BLOCK_H + C2_K - 1) * (BLOCK_W + C2_K - 1) * sizeof(float);
-                // = 6 * 12 * 12 = 864 float ≈ 3.4KB
-
-                conv2_if2_forward_shared_const<BLOCK_H, BLOCK_W>
-                    <<<grid, block, shared_bytes>>>(
-                        d_pool1_out,   // [cur_batch,6,12,12]
-                        d_if2_v,       // IF2膜电位
-                        d_if2_out,     // IF2输出脉冲
-                        cur_batch,
-                        P1_H, P1_W,    // 12, 12
-                        1.0f           // 阈值
-                    );
-                checkCudaErrors(cudaGetLastError());
-            }
-
-            // (6) pool2: [16,8,8] -> [16,4,4]
-            {
-                dim3 block(16, 16);
-                dim3 grid(
-                    (P2_W + block.x - 1) / block.x,  // P2_W = 4
-                    (P2_H + block.y - 1) / block.y,  // P2_H = 4
-                    cur_batch * C2_OUT_C             // 合并 N 和 C
-                );
-
-                maxpool2d_forward_batch_fast<<<grid, block>>>(
-                    d_if2_out,    // in:  [cur_batch, 16, 8, 8]
-                    d_pool2_out,  // out: [cur_batch, 16, 4, 4]
-                    cur_batch, C2_OUT_C,
-                    C2_H, C2_W,   // H_in=8, W_in=8
-                    P2_K, P2_STR  // K=2, stride=2
-                );
-                checkCudaErrors(cudaGetLastError());
-            }
-
-            // (8) fc1 + IF3: [N,256] -> [N,120] -> spike
-            {
-                int total = cur_batch * FC1_OUT;
-                int blocks_fc1 = (total + THREADS - 1) / THREADS;
-                fc_if_forward_batch<<<blocks_fc1, THREADS>>>(
-                    d_pool2_out,   // x: [N,256]
-                    d_fc1_w, d_fc1_b,
-                    d_if3_v,       // v: [N,120]
-                    d_if3_out,     // out: [N,120]
-                    cur_batch,
-                    FC1_IN, FC1_OUT,
-                    1.0f           // threshold
-                );
-                checkCudaErrors(cudaGetLastError());
-            }
-
-            // (9) fc2 + IF4: [N,120] -> [N,84] -> spike
-            {
-                int total = cur_batch * FC2_OUT;
-                int blocks_fc2 = (total + THREADS - 1) / THREADS;
-                fc_if_forward_batch<<<blocks_fc2, THREADS>>>(
-                    d_if3_out,     // x: [N,120]
-                    d_fc2_w, d_fc2_b,
-                    d_if4_v,       // v: [N,84]
-                    d_if4_out,     // out: [N,84]
-                    cur_batch,
-                    FC2_IN, FC2_OUT,
-                    1.0f
-                );
-                checkCudaErrors(cudaGetLastError());
-            }
-
-            // (10) fc3: [84] -> [10] (最终输出不再过 IF)
-            // (11) logits 累加：logits_sum += fc3_out
-            {
-                int total = cur_batch * FC3_OUT;
-                int blocks = (total + THREADS - 1) / THREADS;
-                fc3_and_accumulate_batch<<<blocks, THREADS>>>(
-                    d_if4_out, d_fc3_w, d_fc3_b,
-                    d_logits_sum,
-                    cur_batch,
-                    FC3_IN, FC3_OUT
-                );
-            }
-        } // T loop
-
+            // 流2: 处理第二个batch（与流1并行）
+            process_batch(stream2, d_input_2, cur_batch_2, 
+                        d_conv1_out_2, d_if1_v_2, d_if1_out_2, 
+                        d_pool1_out_2, d_if2_v_2, d_if2_out_2,
+                        d_pool2_out_2, d_if3_v_2, d_if3_out_2,
+                        d_if4_v_2, d_if4_out_2, d_logits_sum_2,
+                        d_fc1_w, d_fc1_b, d_fc2_w, d_fc2_b,
+                        d_fc3_w, d_fc3_b);
+        }
+        // 等待两个流完成
+        cudaStreamSynchronize(stream1);
         // 5. 把 logits_sum 拷回 CPU，除以 T，然后 argmax 得到预测类别
         cudaMemcpy(
             h_logits.data(),
@@ -440,6 +294,29 @@ std::vector<int> scnn_inference(
                 }
             }
             predictions.push_back(pred);
+        }
+        cudaStreamSynchronize(stream2);
+        // 5. 把 logits_sum 拷回 CPU，除以 T，然后 argmax 得到预测类别
+        if(cur_batch_2 > 0)
+        {
+            cudaMemcpy(
+                h_logits.data(),
+                d_logits_sum_2,
+                cur_batch_2 * FC3_OUT * sizeof(float),
+                cudaMemcpyDeviceToHost
+            );
+            for (int n = 0; n < cur_batch_2; ++n) {
+                int pred = 0;
+                float best = h_logits[n * FC3_OUT] / T;
+                for (int k = 1; k < FC3_OUT; ++k) {
+                    float v = h_logits[n * FC3_OUT + k] / T;
+                    if (v > best) {
+                        best = v;
+                        pred = k;
+                    }
+                }
+                predictions.push_back(pred);
+            }
         }
     } // image loop
 
@@ -463,6 +340,23 @@ std::vector<int> scnn_inference(
 
     cudaFree(d_logits_sum);
 
+    cudaFree(d_conv1_out_2);
+    cudaFree(d_if1_v_2);
+    cudaFree(d_if1_out_2);
+    cudaFree(d_pool1_out_2);
+
+    cudaFree(d_if2_v_2);
+    cudaFree(d_if2_out_2);
+    cudaFree(d_pool2_out_2);
+
+    cudaFree(d_if3_v_2);
+    cudaFree(d_if3_out_2);
+
+    cudaFree(d_if4_v_2);
+    cudaFree(d_if4_out_2);
+
+    cudaFree(d_logits_sum_2);
+
     // Memory is freed in main.
 
     return predictions;
@@ -478,9 +372,9 @@ int main(int argc, char* argv[]) {
     }
 	std::string dir = argv[1];
 	
-    // Load test data
-    auto images = read_mnist_images(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
-    auto labels = read_mnist_labels(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
+    // Load test data"/../../.." +"/../../.." +
+    auto images = read_mnist_images(dir +  "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
+    auto labels = read_mnist_labels(dir +  "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
     if (images.empty() || labels.empty()) return 1;
 
     // Load model parameters to host memory
@@ -719,6 +613,61 @@ __global__ void fc_if_forward_batch(
     } else {
         out[idx] = 0.0f;
         v[idx]   = vi;
+    }
+}
+
+// 优化版本：使用向量化加载和更好的内存访问模式
+__global__ void fc_if_forward_batch_optimized(
+    const float* __restrict__ x,
+    const float* __restrict__ W,
+    const float* __restrict__ b,
+    float* __restrict__ v,
+    float* __restrict__ out,
+    int N,
+    int in_features,
+    int out_features,
+    float threshold
+){
+    const int TILE_SIZE = 4; // 使用float4向量化
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * out_features;
+    if (idx >= total) return;
+
+    int n = idx / out_features;
+    int o = idx % out_features;
+
+    const float* x_row = x + n * in_features;
+    const float* w_row = W + o * in_features;
+
+    // 使用向量化累加
+    float sum = b[o];
+    
+    // 主循环：向量化处理
+    int j = 0;
+    for (; j <= in_features - TILE_SIZE; j += TILE_SIZE) {
+        float4 x_vec = reinterpret_cast<const float4*>(x_row + j)[0];
+        float4 w_vec = reinterpret_cast<const float4*>(w_row + j)[0];
+        
+        sum += x_vec.x * w_vec.x;
+        sum += x_vec.y * w_vec.y;
+        sum += x_vec.z * w_vec.z;
+        sum += x_vec.w * w_vec.w;
+    }
+    
+    // 处理剩余元素
+    for (; j < in_features; ++j) {
+        sum += w_row[j] * x_row[j];
+    }
+
+    // IF神经元逻辑
+    float vi = v[idx] + sum;
+    if (vi >= threshold) {
+        out[idx] = 1.0f;
+        v[idx] = 0.0f;
+    } else {
+        out[idx] = 0.0f;
+        v[idx] = vi;
     }
 }
 
@@ -1004,4 +953,266 @@ __global__ void conv2_if2_forward_shared_const(
       s_mem,
       N, H_in, W_in,
       threshold);
+}
+
+// 优化版本：减少bank冲突，更好的shared memory访问
+template<int BLOCK_H, int BLOCK_W>
+__global__ void conv2_if2_forward_shared_const_optimized(
+    const float* __restrict__ in,
+    float* __restrict__ v,
+    float* __restrict__ out,
+    int N,
+    int H_in,
+    int W_in,
+    float threshold
+){
+    extern __shared__ float s_mem[];
+    
+    constexpr int C_IN = 6, C_OUT = 16, K = 5;
+    constexpr int TILE_H = BLOCK_H + K - 1;
+    constexpr int TILE_W = BLOCK_W + K - 1;
+    
+    // 重新组织shared memory布局减少bank冲突
+    #define S_IN(ci, h, w) s_mem[(ci) * (TILE_H * TILE_W) + (h) * TILE_W + (w)]
+    
+    int out_w0 = blockIdx.x * BLOCK_W;
+    int out_h0 = blockIdx.y * BLOCK_H;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int co_n = blockIdx.z;
+    int n = co_n / C_OUT;
+    int co = co_n % C_OUT;
+    
+    if (n >= N) return;
+    
+    int H_out = (H_in - K) / 1 + 1;
+    int W_out = (W_in - K) / 1 + 1;
+    
+    // 1. 优化shared memory加载：使用向量化
+    for (int ci = 0; ci < C_IN; ++ci) {
+        for (int th = ty; th < TILE_H; th += BLOCK_H) {
+            int h_in = out_h0 + th;
+            for (int tw = tx; tw < TILE_W; tw += BLOCK_W) {
+                int w_in = out_w0 + tw;
+                
+                float val = 0.0f;
+                if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
+                    int idx_in = ((n * C_IN + ci) * H_in + h_in) * W_in + w_in;
+                    val = in[idx_in];
+                }
+                S_IN(ci, th, tw) = val;
+            }
+        }
+    }
+    
+    __syncthreads();
+    
+    // 2. 卷积计算 + IF
+    int h_out = out_h0 + ty;
+    int w_out = out_w0 + tx;
+    
+    if (h_out < H_out && w_out < W_out) {
+        float sum = d_conv2_b_const[co];
+        int w_base_co = co * (C_IN * K * K);
+        
+        // 展开内层循环
+        #pragma unroll
+        for (int ci = 0; ci < C_IN; ++ci) {
+            int w_base_ci = w_base_co + ci * (K * K);
+            
+            #pragma unroll
+            for (int kh = 0; kh < K; ++kh) {
+                int th = ty + kh;
+                
+                #pragma unroll  
+                for (int kw = 0; kw < K; ++kw) {
+                    int tw = tx + kw;
+                    
+                    float vin = S_IN(ci, th, tw);
+                    int idx_w = w_base_ci + kh * K + kw;
+                    float ww = d_conv2_w_const[idx_w];
+                    
+                    sum += vin * ww;
+                }
+            }
+        }
+        
+        // IF神经元
+        int idx_out = ((n * C_OUT + co) * H_out + h_out) * W_out + w_out;
+        float vi = v[idx_out] + sum;
+        
+        if (vi >= threshold) {
+            out[idx_out] = 1.0f;
+            v[idx_out] = 0.0f;
+        } else {
+            out[idx_out] = 0.0f;
+            v[idx_out] = vi;
+        }
+    }
+    
+    #undef S_IN
+}
+
+void process_batch(
+    cudaStream_t stream,
+    const float* d_input, int cur_batch,
+    float* d_conv1_out, float* d_if1_v, float* d_if1_out,
+    float* d_pool1_out, float* d_if2_v, float* d_if2_out, 
+    float* d_pool2_out, float* d_if3_v, float* d_if3_out,
+    float* d_if4_v, float* d_if4_out, float* d_logits_sum,
+    float* d_fc1_w,   float* d_fc1_b,   float* d_fc2_w,   float* d_fc2_b,
+    float* d_fc3_w,   float* d_fc3_b)
+{
+    // (1) conv1: [1,28,28] -> [6,24,24]
+    {
+        constexpr int BLOCK_H = 16;
+        constexpr int BLOCK_W = 16;
+
+        dim3 block(BLOCK_W, BLOCK_H);
+        dim3 grid(
+            (C1_W + BLOCK_W - 1) / BLOCK_W, // C1_W=24
+            (C1_H + BLOCK_H - 1) / BLOCK_H, // C1_H=24
+            cur_batch * C1_OUT_C            // 6
+        );
+
+        size_t shared_bytes =
+            C1_IN_C * (BLOCK_H + C1_K - 1) * (BLOCK_W + C1_K - 1) * sizeof(float);
+        // = 1 * 20 * 20 = 400 float ≈ 1.6KB
+
+        conv1_forward_shared_const<BLOCK_H, BLOCK_W>
+            <<<grid, block, shared_bytes>>>(
+                d_input,       // [cur_batch,1,28,28]
+                d_conv1_out,   // [cur_batch,6,24,24]
+                cur_batch,
+                IMG_H, IMG_W
+            );
+        checkCudaErrors(cudaGetLastError());
+    }
+    // 在 T 个时间步上循环
+    for (int t = 0; t < T; ++t) {
+        
+        // (2) IF1: conv1_out -> if1_out (0/1)，更新 d_if1_v
+        {
+            int blocks = (cur_batch * C1_N + THREADS - 1) / THREADS;
+            ifnode_forward<<<blocks, THREADS>>>(
+                d_conv1_out,
+                d_if1_v,
+                d_if1_out,
+                cur_batch * C1_N,
+                1.0f
+            );
+            checkCudaErrors(cudaGetLastError());
+        }
+
+        // (3) pool1: [6,24,24] -> [6,12,12]
+        {
+            dim3 block(16, 16);  // 每个 block 覆盖 16x16 个 (h_out, w_out)
+            dim3 grid(
+                (P1_W + block.x - 1) / block.x,  // P1_W = 12
+                (P1_H + block.y - 1) / block.y,  // P1_H = 12
+                cur_batch * C1_OUT_C             // 合并 N 和 C
+            );
+
+            maxpool2d_forward_batch_fast<<<grid, block>>>(
+                d_if1_out,    // in:  [cur_batch, 6, 24, 24]
+                d_pool1_out,  // out: [cur_batch, 6, 12, 12]
+                cur_batch, C1_OUT_C,
+                C1_H, C1_W,
+                P1_K, P1_STR  // K=2, stride=2
+            );
+            checkCudaErrors(cudaGetLastError());
+        }
+
+        // (4+5) 融合 conv2 + IF2: [6,12,12] -> [16,8,8] -> IF脉冲
+        {
+            constexpr int BLOCK_H = 8;
+            constexpr int BLOCK_W = 8;
+
+            dim3 block(BLOCK_W, BLOCK_H);
+            dim3 grid(
+                (C2_W + BLOCK_W - 1) / BLOCK_W, // C2_W=8
+                (C2_H + BLOCK_H - 1) / BLOCK_H, // C2_H=8
+                cur_batch * C2_OUT_C            // 16
+            );
+
+            size_t shared_bytes =
+                C2_IN_C * (BLOCK_H + C2_K - 1) * (BLOCK_W + C2_K - 1) * sizeof(float);
+            // = 6 * 12 * 12 = 864 float ≈ 3.4KB
+
+            conv2_if2_forward_shared_const_optimized<BLOCK_H, BLOCK_W>
+                <<<grid, block, shared_bytes>>>(
+                    d_pool1_out,   // [cur_batch,6,12,12]
+                    d_if2_v,       // IF2膜电位
+                    d_if2_out,     // IF2输出脉冲
+                    cur_batch,
+                    P1_H, P1_W,    // 12, 12
+                    1.0f           // 阈值
+                );
+            checkCudaErrors(cudaGetLastError());
+        }
+
+        // (6) pool2: [16,8,8] -> [16,4,4]
+        {
+            dim3 block(16, 16);
+            dim3 grid(
+                (P2_W + block.x - 1) / block.x,  // P2_W = 4
+                (P2_H + block.y - 1) / block.y,  // P2_H = 4
+                cur_batch * C2_OUT_C             // 合并 N 和 C
+            );
+
+            maxpool2d_forward_batch_fast<<<grid, block>>>(
+                d_if2_out,    // in:  [cur_batch, 16, 8, 8]
+                d_pool2_out,  // out: [cur_batch, 16, 4, 4]
+                cur_batch, C2_OUT_C,
+                C2_H, C2_W,   // H_in=8, W_in=8
+                P2_K, P2_STR  // K=2, stride=2
+            );
+            checkCudaErrors(cudaGetLastError());
+        }
+
+        // (8) fc1 + IF3: [N,256] -> [N,120] -> spike
+        {
+            int total = cur_batch * FC1_OUT;
+            int blocks_fc1 = (total + THREADS - 1) / THREADS;
+            fc_if_forward_batch_optimized<<<blocks_fc1, THREADS>>>(
+                d_pool2_out,   // x: [N,256]
+                d_fc1_w, d_fc1_b,
+                d_if3_v,       // v: [N,120]
+                d_if3_out,     // out: [N,120]
+                cur_batch,
+                FC1_IN, FC1_OUT,
+                1.0f           // threshold
+            );
+            checkCudaErrors(cudaGetLastError());
+        }
+
+        // (9) fc2 + IF4: [N,120] -> [N,84] -> spike
+        {
+            int total = cur_batch * FC2_OUT;
+            int blocks_fc2 = (total + THREADS - 1) / THREADS;
+            fc_if_forward_batch_optimized<<<blocks_fc2, THREADS>>>(
+                d_if3_out,     // x: [N,120]
+                d_fc2_w, d_fc2_b,
+                d_if4_v,       // v: [N,84]
+                d_if4_out,     // out: [N,84]
+                cur_batch,
+                FC2_IN, FC2_OUT,
+                1.0f
+            );
+            checkCudaErrors(cudaGetLastError());
+        }
+
+        // (10) fc3: [84] -> [10] (最终输出不再过 IF)
+        // (11) logits 累加：logits_sum += fc3_out
+        {
+            int total = cur_batch * FC3_OUT;
+            int blocks = (total + THREADS - 1) / THREADS;
+            fc3_and_accumulate_batch<<<blocks, THREADS>>>(
+                d_if4_out, d_fc3_w, d_fc3_b,
+                d_logits_sum,
+                cur_batch,
+                FC3_IN, FC3_OUT
+            );
+        }
+    } // T loop
 }
