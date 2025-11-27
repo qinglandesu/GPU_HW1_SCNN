@@ -509,6 +509,95 @@ int main(int argc, char* argv[]) {
 // Main Function -  DO NOT MODIFY END
 // ===================================================================================
 
+// 添加更多PTX优化函数
+
+// 使用PTX优化的IF神经元
+// 简化的PTX优化 - 只在关键计算使用PTX
+__global__ void ifnode_forward_ptx(
+    const float* __restrict__ in,
+    float* __restrict__ v,
+    float* __restrict__ out,
+    int N,
+    float threshold)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    float current_v, current_in;
+    
+    // 使用PTX加载（比普通加载更快）
+    asm("ld.global.f32 %0, [%1];" : "=f"(current_in) : "l"(in + i));
+    asm("ld.global.f32 %0, [%1];" : "=f"(current_v) : "l"(v + i));
+    
+    // 普通C++计算（编译器会优化）
+    float new_v = current_v + current_in;
+    
+    if (new_v >= threshold) {
+        out[i] = 1.0f;
+        v[i] = 0.0f;
+    } else {
+        out[i] = 0.0f;
+        v[i] = new_v;
+    }
+}
+
+// 使用PTX优化的最大池化
+__global__ void maxpool2d_forward_batch_ptx(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int N, int C,
+    int H_in, int W_in,
+    int K, int stride)
+{
+    int w_out = blockIdx.x * blockDim.x + threadIdx.x;
+    int h_out = blockIdx.y * blockDim.y + threadIdx.y;
+    int nc = blockIdx.z;
+
+    int H_out = (H_in - K) / stride + 1;
+    int W_out = (W_in - K) / stride + 1;
+
+    if (w_out >= W_out || h_out >= H_out || nc >= N * C) return;
+
+    int n = nc / C;
+    int c = nc % C;
+
+    int h0 = h_out * stride;
+    int w0 = w_out * stride;
+
+    float max_val;
+    asm("mov.f32 %0, 0ff0000000;" : "=f"(max_val)); // -inf
+
+    // 针对2x2池化的PTX优化
+    if (K == 2 && stride == 2) {
+        int idx_base = ((n * C + c) * H_in + h0) * W_in + w0;
+        
+        float v00, v01, v10, v11;
+        asm("ld.global.f32 %0, [%1];" : "=f"(v00) : "l"(in + idx_base));
+        asm("ld.global.f32 %0, [%1];" : "=f"(v01) : "l"(in + idx_base + 1));
+        asm("ld.global.f32 %0, [%1];" : "=f"(v10) : "l"(in + idx_base + W_in));
+        asm("ld.global.f32 %0, [%1];" : "=f"(v11) : "l"(in + idx_base + W_in + 1));
+
+        // PTX最大值计算
+        asm("max.f32 %0, %1, %2;" : "=f"(max_val) : "f"(v00), "f"(v01));
+        asm("max.f32 %0, %1, %2;" : "=f"(max_val) : "f"(max_val), "f"(v10));
+        asm("max.f32 %0, %1, %2;" : "=f"(max_val) : "f"(max_val), "f"(v11));
+    } else {
+        // 通用版本
+        for (int kh = 0; kh < K; ++kh) {
+            for (int kw = 0; kw < K; ++kw) {
+                int idx = ((n * C + c) * H_in + (h0 + kh)) * W_in + (w0 + kw);
+                float val;
+                asm("ld.global.f32 %0, [%1];" : "=f"(val) : "l"(in + idx));
+                asm("max.f32 %0, %1, %2;" : "=f"(max_val) : "f"(max_val), "f"(val));
+            }
+        }
+    }
+
+    int idx_out = ((n * C + c) * H_out + h_out) * W_out + w_out;
+    asm("st.global.f32 [%0], %1;" :: "l"(out + idx_out), "f"(max_val));
+}
+
+
 
 // IF 脉冲神经元：逐元素更新膜电位并生成 0/1 脉冲
 __global__ void ifnode_forward(
@@ -1163,7 +1252,7 @@ void process_batch(
         // (2) IF1: conv1_out -> if1_out (0/1)，更新 d_if1_v
         {
             int blocks = (cur_batch * C1_N + THREADS - 1) / THREADS;
-            ifnode_forward_optimized<<<blocks, THREADS>>>(
+            ifnode_forward_ptx<<<blocks, THREADS>>>(
                 d_conv1_out,
                 d_if1_v,
                 d_if1_out,
@@ -1182,7 +1271,7 @@ void process_batch(
                 cur_batch * C1_OUT_C             // 合并 N 和 C
             );
 
-            maxpool2d_forward_batch_fast<<<grid, block>>>(
+            maxpool2d_forward_batch_ptx<<<grid, block>>>(
                 d_if1_out,    // in:  [cur_batch, 6, 24, 24]
                 d_pool1_out,  // out: [cur_batch, 6, 12, 12]
                 cur_batch, C1_OUT_C,
@@ -1229,7 +1318,7 @@ void process_batch(
                 cur_batch * C2_OUT_C             // 合并 N 和 C
             );
 
-            maxpool2d_forward_batch_fast<<<grid, block>>>(
+            maxpool2d_forward_batch_ptx<<<grid, block>>>(
                 d_if2_out,    // in:  [cur_batch, 16, 8, 8]
                 d_pool2_out,  // out: [cur_batch, 16, 4, 4]
                 cur_batch, C2_OUT_C,
