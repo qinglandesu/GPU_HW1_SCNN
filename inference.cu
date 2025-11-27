@@ -7,13 +7,13 @@
 #include <numeric>
 #include <algorithm>
 
-/**/
+/*
 __device__ __host__ uint32_t __builtin_bswap32(uint32_t val) {
     return ((val & 0x000000FF) << 24) |
            ((val & 0x0000FF00) << 8) |
            ((val & 0x00FF0000) >> 8) |
            ((val & 0xFF000000) >> 24);
-}
+}*/
 
 // conv1: 1x28x28 -> 6x24x24, K=5
 // 权重： [C_out, C_in, K, K] = [6, 1, 5, 5] 共 150 个 float
@@ -73,12 +73,14 @@ __global__ void conv1_forward_shared_const(
 );
 
 template<int BLOCK_H, int BLOCK_W>
-__global__ void conv2_forward_shared_const(
+__global__ void conv2_if2_forward_shared_const(
     const float* __restrict__ in,
-    float* __restrict__ out,
+    float* __restrict__ v,          // IF2膜电位
+    float* __restrict__ out,        // IF2输出
     int N,
     int H_in,
-    int W_in
+    int W_in,
+    float threshold
 );
 
 // ===================================================================================
@@ -159,7 +161,7 @@ std::vector<int> scnn_inference(
 
     // SNN-specific parameter, must match training
     const int T = 8;
-    const int BATCH = 256;
+    const int BATCH = 512;
     // 输入尺寸
     const int IMG_C = 1;
     const int IMG_H = 28;
@@ -206,29 +208,28 @@ std::vector<int> scnn_inference(
     // conv1 / IF1 / pool1
     float *d_conv1_out = nullptr, *d_if1_v = nullptr, *d_if1_out = nullptr;
     float *d_pool1_out = nullptr;
-    checkCudaErrors(cudaMalloc(&d_conv1_out, BATCH * C1_N * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if1_v, BATCH * C1_N * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if1_out, BATCH * C1_N * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_pool1_out, BATCH * P1_N * sizeof(float)));
+    cudaMalloc(&d_conv1_out, BATCH * C1_N * sizeof(float));
+    cudaMalloc(&d_if1_v, BATCH * C1_N * sizeof(float));
+    cudaMalloc(&d_if1_out, BATCH * C1_N * sizeof(float));
+    cudaMalloc(&d_pool1_out, BATCH * P1_N * sizeof(float));
     // conv2 / IF2 / pool2
-    float *d_conv2_out = nullptr, *d_if2_v = nullptr, *d_if2_out = nullptr;
+    float *d_if2_v = nullptr, *d_if2_out = nullptr;
     float *d_pool2_out = nullptr;
-    checkCudaErrors(cudaMalloc(&d_conv2_out, BATCH * C2_N * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if2_v, BATCH * C2_N * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if2_out, BATCH * C2_N * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_pool2_out, BATCH * P2_N * sizeof(float)));
+    cudaMalloc(&d_if2_v, BATCH * C2_N * sizeof(float));
+    cudaMalloc(&d_if2_out, BATCH * C2_N * sizeof(float));
+    cudaMalloc(&d_pool2_out, BATCH * P2_N * sizeof(float));
     // FC1 / IF3
     float *d_if3_v = nullptr, *d_if3_out = nullptr;
-    checkCudaErrors(cudaMalloc(&d_if3_v, BATCH * FC1_OUT * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if3_out, BATCH * FC1_OUT * sizeof(float)));
+    cudaMalloc(&d_if3_v, BATCH * FC1_OUT * sizeof(float));
+    cudaMalloc(&d_if3_out, BATCH * FC1_OUT * sizeof(float));
     // FC2 / IF4
     float *d_if4_v = nullptr, *d_if4_out = nullptr;
-    checkCudaErrors(cudaMalloc(&d_if4_v, BATCH * FC2_OUT * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_if4_out, BATCH * FC2_OUT * sizeof(float)));
+    cudaMalloc(&d_if4_v, BATCH * FC2_OUT * sizeof(float));
+    cudaMalloc(&d_if4_out, BATCH * FC2_OUT * sizeof(float));
     // FC3 输出 logits
     // logits 累积缓冲区
     float* d_logits_sum = nullptr;
-    checkCudaErrors(cudaMalloc(&d_logits_sum, BATCH * FC3_OUT * sizeof(float)));
+    cudaMalloc(&d_logits_sum, BATCH * FC3_OUT * sizeof(float));
     // host 端读取 logits 用于 argmax
     std::vector<float> h_logits(BATCH * FC3_OUT);
 
@@ -261,12 +262,12 @@ std::vector<int> scnn_inference(
         const float* d_input = d_all_images + base * IMG_C * IMG_H * IMG_W;
 
         // 把所有 IF 膜电位清零
-        checkCudaErrors(cudaMemset(d_if1_v, 0, cur_batch * C1_N * sizeof(float)));
-        checkCudaErrors(cudaMemset(d_if2_v, 0, cur_batch * C2_N * sizeof(float)));
-        checkCudaErrors(cudaMemset(d_if3_v, 0, cur_batch * FC1_OUT * sizeof(float)));
-        checkCudaErrors(cudaMemset(d_if4_v, 0, cur_batch * FC2_OUT * sizeof(float)));
+        cudaMemset(d_if1_v, 0, cur_batch * C1_N * sizeof(float));
+        cudaMemset(d_if2_v, 0, cur_batch * C2_N * sizeof(float));
+        cudaMemset(d_if3_v, 0, cur_batch * FC1_OUT * sizeof(float));
+        cudaMemset(d_if4_v, 0, cur_batch * FC2_OUT * sizeof(float));
         // logits_sum 清零
-        checkCudaErrors(cudaMemset(d_logits_sum, 0, cur_batch * FC3_OUT * sizeof(float)));
+        cudaMemset(d_logits_sum, 0, cur_batch * FC3_OUT * sizeof(float));
 
         // (1) conv1: [1,28,28] -> [6,24,24]
         {
@@ -328,7 +329,7 @@ std::vector<int> scnn_inference(
                 checkCudaErrors(cudaGetLastError());
             }
 
-            // (4) conv2: [6,12,12] -> [16,8,8]
+            // (4+5) 融合 conv2 + IF2: [6,12,12] -> [16,8,8] -> IF脉冲
             {
                 constexpr int BLOCK_H = 8;
                 constexpr int BLOCK_W = 8;
@@ -344,26 +345,15 @@ std::vector<int> scnn_inference(
                     C2_IN_C * (BLOCK_H + C2_K - 1) * (BLOCK_W + C2_K - 1) * sizeof(float);
                 // = 6 * 12 * 12 = 864 float ≈ 3.4KB
 
-                conv2_forward_shared_const<BLOCK_H, BLOCK_W>
+                conv2_if2_forward_shared_const<BLOCK_H, BLOCK_W>
                     <<<grid, block, shared_bytes>>>(
                         d_pool1_out,   // [cur_batch,6,12,12]
-                        d_conv2_out,   // [cur_batch,16,8,8]
+                        d_if2_v,       // IF2膜电位
+                        d_if2_out,     // IF2输出脉冲
                         cur_batch,
-                        P1_H, P1_W     // 12, 12
+                        P1_H, P1_W,    // 12, 12
+                        1.0f           // 阈值
                     );
-                checkCudaErrors(cudaGetLastError());
-            }
-
-            // (5) IF2: conv2_out -> if2_out
-            {
-                int blocks = (cur_batch * C2_N + THREADS - 1) / THREADS;
-                ifnode_forward<<<blocks, THREADS>>>(
-                    d_conv2_out,
-                    d_if2_v,
-                    d_if2_out,
-                    cur_batch * C2_N,
-                    1.0f
-                );
                 checkCudaErrors(cudaGetLastError());
             }
 
@@ -433,12 +423,12 @@ std::vector<int> scnn_inference(
         } // T loop
 
         // 5. 把 logits_sum 拷回 CPU，除以 T，然后 argmax 得到预测类别
-        checkCudaErrors(cudaMemcpy(
+        cudaMemcpy(
             h_logits.data(),
             d_logits_sum,
             cur_batch * FC3_OUT * sizeof(float),
             cudaMemcpyDeviceToHost
-        ));
+        );
         for (int n = 0; n < cur_batch; ++n) {
             int pred = 0;
             float best = h_logits[n * FC3_OUT] / T;
@@ -461,7 +451,6 @@ std::vector<int> scnn_inference(
     cudaFree(d_if1_out);
     cudaFree(d_pool1_out);
 
-    cudaFree(d_conv2_out);
     cudaFree(d_if2_v);
     cudaFree(d_if2_out);
     cudaFree(d_pool2_out);
@@ -489,9 +478,9 @@ int main(int argc, char* argv[]) {
     }
 	std::string dir = argv[1];
 	
-    // Load test data"/../../.." +"/../../.." +
-    auto images = read_mnist_images(dir +  "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
-    auto labels = read_mnist_labels(dir +  "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
+    // Load test data
+    auto images = read_mnist_images(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
+    auto labels = read_mnist_labels(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
     if (images.empty() || labels.empty()) return 1;
 
     // Load model parameters to host memory
@@ -543,24 +532,24 @@ int main(int argc, char* argv[]) {
 // ===================================================================================
 
     // 拷贝到 constant memory
-    checkCudaErrors(cudaMemcpyToSymbol(
+    cudaMemcpyToSymbol(
         d_conv1_w_const,
         conv1_w.data(),
         conv1_w.size() * sizeof(float),
-        0, cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpyToSymbol(
+        0, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(
         d_conv1_b_const,
         conv1_b.data(),
         conv1_b.size() * sizeof(float),
-        0, cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpyToSymbol(
+        0, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(
         d_conv2_w_const, conv2_w.data(),
         conv2_w.size() * sizeof(float),
-        0, cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpyToSymbol(
+        0, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(
         d_conv2_b_const, conv2_b.data(),
         conv2_b.size() * sizeof(float),
-        0, cudaMemcpyHostToDevice));
+        0, cudaMemcpyHostToDevice);
 
 
     // --- 3. Perform inference ---
@@ -881,26 +870,138 @@ __global__ void conv1_forward_shared_const(
       N, H_in, W_in);
 }
 
-// conv2: 6x12x12 -> 16x8x8
-template<int BLOCK_H, int BLOCK_W>
-__global__ void conv2_forward_shared_const(
+// 融合卷积和IF神经元的核函数
+template<
+    int C_IN,
+    int C_OUT,
+    int K,
+    int STRIDE,
+    int PADDING,
+    int BLOCK_H,
+    int BLOCK_W
+>
+__device__ void conv_if_shared_core(
     const float* __restrict__ in,
-    float* __restrict__ out,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ v,          // 膜电位（需要跨时间步保留）
+    float* __restrict__ out,        // 脉冲输出 0/1
+    float* __restrict__ s_in,       // shared memory: [C_IN, TILE_H, TILE_W]
     int N,
     int H_in,
-    int W_in
+    int W_in,
+    float threshold                 // IF神经元阈值
+){
+    int H_out = (H_in + 2 * PADDING - K) / STRIDE + 1;
+    int W_out = (W_in + 2 * PADDING - K) / STRIDE + 1;
+
+    int out_w0 = blockIdx.x * BLOCK_W;
+    int out_h0 = blockIdx.y * BLOCK_H;
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int co_n = blockIdx.z;
+    int n  = co_n / C_OUT;
+    int co = co_n % C_OUT;
+    if (n >= N) return;
+
+    constexpr int TILE_H = BLOCK_H + K - 1;
+    constexpr int TILE_W = BLOCK_W + K - 1;
+
+    // -------- 1. load 输入 patch -> shared memory --------
+    for (int ci = 0; ci < C_IN; ++ci) {
+        for (int th = ty; th < TILE_H; th += BLOCK_H) {
+            int h_in = out_h0 * STRIDE - PADDING + th;
+
+            for (int tw = tx; tw < TILE_W; tw += BLOCK_W) {
+                int w_in = out_w0 * STRIDE - PADDING + tw;
+
+                float val = 0.0f;
+                if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
+                    int idx_in = ((n * C_IN + ci) * H_in + h_in) * W_in + w_in;
+                    val = in[idx_in];
+                }
+
+                int idx_s = (ci * TILE_H + th) * TILE_W + tw;
+                s_in[idx_s] = val;
+            }
+        }
+    }
+
+    __syncthreads();
+
+    // -------- 2. 每个 thread 计算一个输出像素 --------
+    int h_out = out_h0 + ty;
+    int w_out = out_w0 + tx;
+    if (h_out >= H_out || w_out >= W_out) return;
+
+    // 卷积计算
+    float sum = b[co];
+    int w_base_co = co * (C_IN * K * K);
+
+    #pragma unroll
+    for (int ci = 0; ci < C_IN; ++ci) {
+        int w_base_ci = w_base_co + ci * (K * K);
+
+        #pragma unroll
+        for (int kh = 0; kh < K; ++kh) {
+            int th = ty + kh;
+
+            #pragma unroll
+            for (int kw = 0; kw < K; ++kw) {
+                int tw = tx + kw;
+
+                int idx_s = (ci * TILE_H + th) * TILE_W + tw;
+                float vin = s_in[idx_s];
+
+                int idx_w = w_base_ci + kh * K + kw;
+                float ww  = w[idx_w];
+
+                sum += vin * ww;
+            }
+        }
+    }
+
+    // -------- 3. IF神经元计算 --------
+    int idx_out = ((n * C_OUT + co) * H_out + h_out) * W_out + w_out;
+    int idx_v = idx_out;  // 膜电位与输出同形状
+    
+    float vi = v[idx_v] + sum;  // 更新膜电位
+    
+    if (vi >= threshold) {
+        out[idx_out] = 1.0f;    // 产生脉冲
+        v[idx_v] = 0.0f;        // 重置膜电位
+    } else {
+        out[idx_out] = 0.0f;
+        v[idx_v] = vi;          // 保持膜电位
+    }
+}
+
+// 融合的conv2+IF2核函数
+template<int BLOCK_H, int BLOCK_W>
+__global__ void conv2_if2_forward_shared_const(
+    const float* __restrict__ in,
+    float* __restrict__ v,          // IF2膜电位
+    float* __restrict__ out,        // IF2输出
+    int N,
+    int H_in,
+    int W_in,
+    float threshold
 ){
     // shared memory: [C_IN=6, TILE_H, TILE_W]
     extern __shared__ float s_mem[];
 
-    conv_shared_core<
+    conv_if_shared_core<
         6, 16,       // C_IN, C_OUT
         5, 1, 0,     // K, STRIDE, PADDING
         BLOCK_H, BLOCK_W
     >(in,
       d_conv2_w_const,
       d_conv2_b_const,
+      v,
       out,
       s_mem,
-      N, H_in, W_in);
+      N, H_in, W_in,
+      threshold);
 }
