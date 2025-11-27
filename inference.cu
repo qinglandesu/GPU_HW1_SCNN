@@ -6,14 +6,17 @@
 #include <iomanip>
 #include <numeric>
 #include <algorithm>
+#include <unordered_map>
+#include <queue>
+#include <mutex>
 
-/**/
+/*
 __device__ __host__ uint32_t __builtin_bswap32(uint32_t val) {
     return ((val & 0x000000FF) << 24) |
            ((val & 0x0000FF00) << 8) |
            ((val & 0x00FF0000) >> 8) |
            ((val & 0xFF000000) >> 24);
-}
+}*/
 
 __constant__ float d_conv1_w_const[6 * 1 * 5 * 5];
 __constant__ float d_conv1_b_const[6];
@@ -67,6 +70,57 @@ const int FC3_OUT = 10;
 
 // kernel 启动配置（简单用 1D 配置，conv/pool 自己在实现里用 3D 也可以）
 const int THREADS = 128;
+
+// 内存池实现
+class CachedMemoryAllocator {
+private:
+    std::unordered_map<size_t, std::queue<float*>> memory_pool_;
+    std::mutex mutex_;
+    
+public:
+    float* allocate(size_t num_elements) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        size_t size_bytes = num_elements * sizeof(float);
+        
+        auto it = memory_pool_.find(size_bytes);
+        if (it != memory_pool_.end() && !it->second.empty()) {
+            float* ptr = it->second.front();
+            it->second.pop();
+            return ptr;
+        }
+        
+        float* ptr = nullptr;
+        cudaMalloc(&ptr, size_bytes);
+        return ptr;
+    }
+    
+    void deallocate(float* ptr, size_t num_elements) {
+        if (ptr == nullptr) return;
+        
+        std::lock_guard<std::mutex> lock(mutex_);
+        size_t size_bytes = num_elements * sizeof(float);
+        memory_pool_[size_bytes].push(ptr);
+    }
+    
+    // 可选：手动清理所有内存
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& pair : memory_pool_) {
+            std::queue<float*>& pool = pair.second;
+            while (!pool.empty()) {
+                cudaFree(pool.front());
+                pool.pop();
+            }
+        }
+    }
+    
+    ~CachedMemoryAllocator() {
+        clear();
+    }
+};
+
+// 全局内存分配器
+static CachedMemoryAllocator g_memory_allocator;
 
 void process_batch(
     cudaStream_t stream,
@@ -160,52 +214,48 @@ std::vector<int> scnn_inference(
 
     // 分配中间特征图和膜电位的 GPU 缓冲区
     // conv1 / IF1 / pool1
-    float *d_conv1_out = nullptr;
-    float *d_if1_v = nullptr, *d_if1_out = nullptr;
-    float *d_pool1_out = nullptr;
-    cudaMalloc(&d_conv1_out, BATCH * C1_N * sizeof(float));
-    cudaMalloc(&d_if1_v, BATCH * C1_N * sizeof(float));
-    cudaMalloc(&d_if1_out, BATCH * C1_N * sizeof(float));
-    cudaMalloc(&d_pool1_out, BATCH * P1_N * sizeof(float));
+    float *d_conv1_out = g_memory_allocator.allocate(BATCH * C1_N);
+    float *d_if1_v = g_memory_allocator.allocate(BATCH * C1_N);
+    float *d_if1_out = g_memory_allocator.allocate(BATCH * C1_N);
+    float *d_pool1_out = g_memory_allocator.allocate(BATCH * P1_N);
     // conv2 / IF2 / pool2
-    float *d_if2_v = nullptr, *d_if2_out = nullptr;
-    float *d_pool2_out = nullptr;
-    cudaMalloc(&d_if2_v, BATCH * C2_N * sizeof(float));
-    cudaMalloc(&d_if2_out, BATCH * C2_N * sizeof(float));
-    cudaMalloc(&d_pool2_out, BATCH * P2_N * sizeof(float));
+    float *d_if2_v = g_memory_allocator.allocate(BATCH * C2_N);
+    float *d_if2_out = g_memory_allocator.allocate(BATCH * C2_N);
+    float *d_pool2_out = g_memory_allocator.allocate(BATCH * P2_N);
     // FC1 / IF3
-    float *d_if3_v = nullptr, *d_if3_out = nullptr;
-    cudaMalloc(&d_if3_v, BATCH * FC1_OUT * sizeof(float));
-    cudaMalloc(&d_if3_out, BATCH * FC1_OUT * sizeof(float));
+    float *d_if3_v = g_memory_allocator.allocate(BATCH * FC1_OUT);
+    float *d_if3_out = g_memory_allocator.allocate(BATCH * FC1_OUT);
     // FC2 / IF4
-    float *d_if4_v = nullptr, *d_if4_out = nullptr;
-    cudaMalloc(&d_if4_v, BATCH * FC2_OUT * sizeof(float));
-    cudaMalloc(&d_if4_out, BATCH * FC2_OUT * sizeof(float));
+    float *d_if4_v = g_memory_allocator.allocate(BATCH * FC2_OUT);
+    float *d_if4_out = g_memory_allocator.allocate(BATCH * FC2_OUT);
     // FC3 输出 logits
     // logits 累积缓冲区
-    float* d_logits_sum = nullptr;
-    cudaMalloc(&d_logits_sum, BATCH * FC3_OUT * sizeof(float));
+    float* d_logits_sum = g_memory_allocator.allocate(BATCH * FC3_OUT);
 
-    float *d_conv1_out_2 = nullptr;
-    float *d_if1_v_2 = nullptr, *d_if1_out_2 = nullptr;
-    float *d_pool1_out_2 = nullptr;
-    cudaMalloc(&d_conv1_out_2, BATCH * C1_N * sizeof(float));
-    cudaMalloc(&d_if1_v_2, BATCH * C1_N * sizeof(float));
-    cudaMalloc(&d_if1_out_2, BATCH * C1_N * sizeof(float));
-    cudaMalloc(&d_pool1_out_2, BATCH * P1_N * sizeof(float));
-    float *d_if2_v_2 = nullptr, *d_if2_out_2 = nullptr;
-    float *d_pool2_out_2 = nullptr;
-    cudaMalloc(&d_if2_v_2, BATCH * C2_N * sizeof(float));
-    cudaMalloc(&d_if2_out_2, BATCH * C2_N * sizeof(float));
-    cudaMalloc(&d_pool2_out_2, BATCH * P2_N * sizeof(float));
-    float *d_if3_v_2 = nullptr, *d_if3_out_2 = nullptr;
-    cudaMalloc(&d_if3_v_2, BATCH * FC1_OUT * sizeof(float));
-    cudaMalloc(&d_if3_out_2, BATCH * FC1_OUT * sizeof(float));
-    float *d_if4_v_2 = nullptr, *d_if4_out_2 = nullptr;
-    cudaMalloc(&d_if4_v_2, BATCH * FC2_OUT * sizeof(float));
-    cudaMalloc(&d_if4_out_2, BATCH * FC2_OUT * sizeof(float));
-    float* d_logits_sum_2 = nullptr;
-    cudaMalloc(&d_logits_sum_2, BATCH * FC3_OUT * sizeof(float));
+    float *d_conv1_out_2 = g_memory_allocator.allocate(BATCH * C1_N);
+    float *d_if1_v_2 = g_memory_allocator.allocate(BATCH * C1_N);
+    float *d_if1_out_2 = g_memory_allocator.allocate(BATCH * C1_N);
+    float *d_pool1_out_2 = g_memory_allocator.allocate(BATCH * P1_N);
+    float *d_if2_v_2 = g_memory_allocator.allocate(BATCH * C2_N);
+    float *d_if2_out_2 = g_memory_allocator.allocate(BATCH * C2_N);
+    float *d_pool2_out_2 = g_memory_allocator.allocate(BATCH * P2_N);
+    float *d_if3_v_2 = g_memory_allocator.allocate(BATCH * FC1_OUT);
+    float *d_if3_out_2 = g_memory_allocator.allocate(BATCH * FC1_OUT);
+    float *d_if4_v_2 = g_memory_allocator.allocate(BATCH * FC2_OUT);
+    float *d_if4_out_2 = g_memory_allocator.allocate(BATCH * FC2_OUT);
+    float* d_logits_sum_2 = g_memory_allocator.allocate(BATCH * FC3_OUT);
+
+    // 检查分配是否成功
+    if (!d_conv1_out || !d_if1_v || !d_if1_out || !d_pool1_out ||
+        !d_if2_v || !d_if2_out || !d_pool2_out ||
+        !d_if3_v || !d_if3_out || !d_if4_v || !d_if4_out || !d_logits_sum ||
+        !d_conv1_out_2 || !d_if1_v_2 || !d_if1_out_2 || !d_pool1_out_2 ||
+        !d_if2_v_2 || !d_if2_out_2 || !d_pool2_out_2 ||
+        !d_if3_v_2 || !d_if3_out_2 || !d_if4_v_2 || !d_if4_out_2 || !d_logits_sum_2)
+    {
+        std::cerr << "GPU memory allocation failed!" << std::endl;
+        return predictions;
+    }
 
     // host 端读取 logits 用于 argmax
     std::vector<float> h_logits(BATCH * FC3_OUT);
@@ -230,7 +280,7 @@ std::vector<int> scnn_inference(
     ));
 
     // --- Loop over each image ---
-    for (int base = 0; base < num_images; base += BATCH * 2) {
+    for (int base = 0; base < num_images; base += BATCH* 2) {
         int cur_batch = std::min(BATCH, num_images - base);
         // images[i] 大小是 28*28
         const float* d_input = d_all_images + base * IMG_C * IMG_H * IMG_W;
@@ -274,6 +324,7 @@ std::vector<int> scnn_inference(
                         d_fc1_w, d_fc1_b, d_fc2_w, d_fc2_b,
                         d_fc3_w, d_fc3_b);
         }
+
         // 等待两个流完成
         cudaStreamSynchronize(stream1);
         // 5. 把 logits_sum 拷回 CPU，除以 T，然后 argmax 得到预测类别
@@ -320,43 +371,6 @@ std::vector<int> scnn_inference(
         }
     } // image loop
 
-    // 释放中间 GPU 内存
-    cudaFree(d_all_images);
-
-    cudaFree(d_conv1_out);
-    cudaFree(d_if1_v);
-    cudaFree(d_if1_out);
-    cudaFree(d_pool1_out);
-
-    cudaFree(d_if2_v);
-    cudaFree(d_if2_out);
-    cudaFree(d_pool2_out);
-
-    cudaFree(d_if3_v);
-    cudaFree(d_if3_out);
-
-    cudaFree(d_if4_v);
-    cudaFree(d_if4_out);
-
-    cudaFree(d_logits_sum);
-
-    cudaFree(d_conv1_out_2);
-    cudaFree(d_if1_v_2);
-    cudaFree(d_if1_out_2);
-    cudaFree(d_pool1_out_2);
-
-    cudaFree(d_if2_v_2);
-    cudaFree(d_if2_out_2);
-    cudaFree(d_pool2_out_2);
-
-    cudaFree(d_if3_v_2);
-    cudaFree(d_if3_out_2);
-
-    cudaFree(d_if4_v_2);
-    cudaFree(d_if4_out_2);
-
-    cudaFree(d_logits_sum_2);
-
     // Memory is freed in main.
 
     return predictions;
@@ -372,9 +386,9 @@ int main(int argc, char* argv[]) {
     }
 	std::string dir = argv[1];
 	
-    // Load test data"/../../.." +"/../../.." +
-    auto images = read_mnist_images(dir +  "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
-    auto labels = read_mnist_labels(dir +  "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
+    // Load test data
+    auto images = read_mnist_images(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
+    auto labels = read_mnist_labels(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
     if (images.empty() || labels.empty()) return 1;
 
     // Load model parameters to host memory
@@ -514,6 +528,61 @@ __global__ void ifnode_forward(
         } else {
             out[i] = 0.0f;
             v[i]   = vi;                 // 没有发放就保持新的膜电位
+        }
+    }
+}
+
+// 优化IF神经元核函数
+__global__ void ifnode_forward_optimized(
+    const float* __restrict__ in,
+    float* __restrict__ v,
+    float* __restrict__ out,
+    int N,
+    float threshold
+){
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // 使用向量化处理
+    const int VEC_SIZE = 4;
+    int vec_i = i * VEC_SIZE;
+    
+    if (vec_i + VEC_SIZE - 1 < N) {
+        // 向量化加载
+        float4 in_vec = reinterpret_cast<const float4*>(in + vec_i)[0];
+        float4 v_vec = reinterpret_cast<const float4*>(v + vec_i)[0];
+        float4 out_vec;
+        
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; ++j) {
+            float* in_ptr = reinterpret_cast<float*>(&in_vec) + j;
+            float* v_ptr = reinterpret_cast<float*>(&v_vec) + j;
+            float* out_ptr = reinterpret_cast<float*>(&out_vec) + j;
+            
+            float vi = *v_ptr + *in_ptr;
+            if (vi >= threshold) {
+                *out_ptr = 1.0f;
+                *v_ptr = 0.0f;
+            } else {
+                *out_ptr = 0.0f;
+                *v_ptr = vi;
+            }
+        }
+        
+        // 向量化存储
+        reinterpret_cast<float4*>(out + vec_i)[0] = out_vec;
+        reinterpret_cast<float4*>(v + vec_i)[0] = v_vec;
+    } else {
+        // 处理剩余元素
+        for (int j = 0; j < VEC_SIZE && vec_i + j < N; ++j) {
+            int idx = vec_i + j;
+            float vi = v[idx] + in[idx];
+            if (vi >= threshold) {
+                out[idx] = 1.0f;
+                v[idx] = 0.0f;
+            } else {
+                out[idx] = 0.0f;
+                v[idx] = vi;
+            }
         }
     }
 }
@@ -1094,7 +1163,7 @@ void process_batch(
         // (2) IF1: conv1_out -> if1_out (0/1)，更新 d_if1_v
         {
             int blocks = (cur_batch * C1_N + THREADS - 1) / THREADS;
-            ifnode_forward<<<blocks, THREADS>>>(
+            ifnode_forward_optimized<<<blocks, THREADS>>>(
                 d_conv1_out,
                 d_if1_v,
                 d_if1_out,
