@@ -71,56 +71,146 @@ const int FC3_OUT = 10;
 // kernel 启动配置（简单用 1D 配置，conv/pool 自己在实现里用 3D 也可以）
 const int THREADS = 128;
 
-// 内存池实现
-class CachedMemoryAllocator {
-private:
-    std::unordered_map<size_t, std::queue<float*>> memory_pool_;
-    std::mutex mutex_;
-    
-public:
-    float* allocate(size_t num_elements) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        size_t size_bytes = num_elements * sizeof(float);
-        
-        auto it = memory_pool_.find(size_bytes);
-        if (it != memory_pool_.end() && !it->second.empty()) {
-            float* ptr = it->second.front();
-            it->second.pop();
-            return ptr;
-        }
-        
-        float* ptr = nullptr;
-        cudaMalloc(&ptr, size_bytes);
-        return ptr;
-    }
-    
-    void deallocate(float* ptr, size_t num_elements) {
-        if (ptr == nullptr) return;
-        
-        std::lock_guard<std::mutex> lock(mutex_);
-        size_t size_bytes = num_elements * sizeof(float);
-        memory_pool_[size_bytes].push(ptr);
-    }
-    
-    // 可选：手动清理所有内存
-    void clear() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& pair : memory_pool_) {
-            std::queue<float*>& pool = pair.second;
-            while (!pool.empty()) {
-                cudaFree(pool.front());
-                pool.pop();
-            }
-        }
-    }
-    
-    ~CachedMemoryAllocator() {
-        clear();
-    }
-};
+// 静态内存池定义
+// 计算总内存需求（单位为元素个数，不是字节）
+const size_t TOTAL_ELEMENTS_PER_STREAM = 
+    BATCH * (C1_N * 3 +    // conv1_out + if1_v + if1_out
+                 P1_N +         // pool1_out
+                 C2_N * 2 +     // if2_v + if2_out  
+                 P2_N +         // pool2_out
+                 FC1_OUT * 2 +  // if3_v + if3_out
+                 FC2_OUT * 2 +  // if4_v + if4_out
+                 FC3_OUT);      // logits_sum
+// 双流需要两套内存
+const size_t TOTAL_ELEMENTS = TOTAL_ELEMENTS_PER_STREAM * 2;
+// 静态device内存池（全局声明）
+__device__ float d_static_pool[TOTAL_ELEMENTS];
 
-// 全局内存分配器
-static CachedMemoryAllocator g_memory_allocator;
+// 修正：使用主机端指针管理偏移，kernel中通过参数传递
+float* d_conv1_out = nullptr;
+float* d_if1_v = nullptr;
+float* d_if1_out = nullptr;
+float* d_pool1_out = nullptr;
+float* d_if2_v = nullptr;
+float* d_if2_out = nullptr;
+float* d_pool2_out = nullptr;
+float* d_if3_v = nullptr;
+float* d_if3_out = nullptr;
+float* d_if4_v = nullptr;
+float* d_if4_out = nullptr;
+float* d_logits_sum = nullptr;
+// 第二套内存（用于stream2）
+float* d_conv1_out_2 = nullptr;
+float* d_if1_v_2 = nullptr;
+float* d_if1_out_2 = nullptr;
+float* d_pool1_out_2 = nullptr;
+float* d_if2_v_2 = nullptr;
+float* d_if2_out_2 = nullptr;
+float* d_pool2_out_2 = nullptr;
+float* d_if3_v_2 = nullptr;
+float* d_if3_out_2 = nullptr;
+float* d_if4_v_2 = nullptr;
+float* d_if4_out_2 = nullptr;
+float* d_logits_sum_2 = nullptr;
+
+// 初始化静态内存池指针
+void init_static_pointers() {
+    // 获取device上静态内存的起始地址
+    void* base_ptr = nullptr;
+    cudaError_t err = cudaGetSymbolAddress(&base_ptr, d_static_pool);
+    if (err != cudaSuccess) {
+        printf("Error getting symbol address: %s\n", cudaGetErrorString(err));
+        return;
+    }
+    
+    // 转换为正确的指针类型
+    float* device_base_ptr = reinterpret_cast<float*>(base_ptr);
+    
+    // 流1的内存分配 - 计算偏移量（主机端计算）
+    size_t offset = 0;
+    d_conv1_out = device_base_ptr + offset;  // 起始地址
+    offset += BATCH * C1_N;
+    
+    d_if1_v = device_base_ptr + offset;
+    offset += BATCH * C1_N;
+    
+    d_if1_out = device_base_ptr + offset;
+    offset += BATCH * C1_N;
+    
+    d_pool1_out = device_base_ptr + offset;
+    offset += BATCH * P1_N;
+    
+    d_if2_v = device_base_ptr + offset;
+    offset += BATCH * C2_N;
+    
+    d_if2_out = device_base_ptr + offset;
+    offset += BATCH * C2_N;
+    
+    d_pool2_out = device_base_ptr + offset;
+    offset += BATCH * P2_N;
+    
+    d_if3_v = device_base_ptr + offset;
+    offset += BATCH * FC1_OUT;
+    
+    d_if3_out = device_base_ptr + offset;
+    offset += BATCH * FC1_OUT;
+    
+    d_if4_v = device_base_ptr + offset;
+    offset += BATCH * FC2_OUT;
+    
+    d_if4_out = device_base_ptr + offset;
+    offset += BATCH * FC2_OUT;
+    
+    d_logits_sum = device_base_ptr + offset;
+    offset += BATCH * FC3_OUT;
+    
+    // 流2的内存分配（接在流1后面）
+    d_conv1_out_2 = device_base_ptr + offset;
+    offset += BATCH * C1_N;
+    
+    d_if1_v_2 = device_base_ptr + offset;
+    offset += BATCH * C1_N;
+    
+    d_if1_out_2 = device_base_ptr + offset;
+    offset += BATCH * C1_N;
+    
+    d_pool1_out_2 = device_base_ptr + offset;
+    offset += BATCH * P1_N;
+    
+    d_if2_v_2 = device_base_ptr + offset;
+    offset += BATCH * C2_N;
+    
+    d_if2_out_2 = device_base_ptr + offset;
+    offset += BATCH * C2_N;
+    
+    d_pool2_out_2 = device_base_ptr + offset;
+    offset += BATCH * P2_N;
+    
+    d_if3_v_2 = device_base_ptr + offset;
+    offset += BATCH * FC1_OUT;
+    
+    d_if3_out_2 = device_base_ptr + offset;
+    offset += BATCH * FC1_OUT;
+    
+    d_if4_v_2 = device_base_ptr + offset;
+    offset += BATCH * FC2_OUT;
+    
+    d_if4_out_2 = device_base_ptr + offset;
+    offset += BATCH * FC2_OUT;
+    
+    d_logits_sum_2 = device_base_ptr + offset;
+    offset += BATCH * FC3_OUT;
+    
+    // 验证指针计算
+    size_t total_calculated = offset;  // 现在offset就是总元素数
+    if (total_calculated != TOTAL_ELEMENTS) {
+        printf("Warning: Memory calculation mismatch! Expected %zu, got %zu\n", 
+               TOTAL_ELEMENTS, total_calculated);
+    }
+    
+    //printf("Static memory pool initialized. Total elements: %zu (%.2f MB)\n",
+    //       TOTAL_ELEMENTS, TOTAL_ELEMENTS * sizeof(float) / (1024.0 * 1024.0));
+}
 
 void process_batch(
     cudaStream_t stream,
@@ -213,38 +303,7 @@ std::vector<int> scnn_inference(
     cudaStreamCreate(&stream2);
 
     // 分配中间特征图和膜电位的 GPU 缓冲区
-    // conv1 / IF1 / pool1
-    float *d_conv1_out = g_memory_allocator.allocate(BATCH * C1_N);
-    float *d_if1_v = g_memory_allocator.allocate(BATCH * C1_N);
-    float *d_if1_out = g_memory_allocator.allocate(BATCH * C1_N);
-    float *d_pool1_out = g_memory_allocator.allocate(BATCH * P1_N);
-    // conv2 / IF2 / pool2
-    float *d_if2_v = g_memory_allocator.allocate(BATCH * C2_N);
-    float *d_if2_out = g_memory_allocator.allocate(BATCH * C2_N);
-    float *d_pool2_out = g_memory_allocator.allocate(BATCH * P2_N);
-    // FC1 / IF3
-    float *d_if3_v = g_memory_allocator.allocate(BATCH * FC1_OUT);
-    float *d_if3_out = g_memory_allocator.allocate(BATCH * FC1_OUT);
-    // FC2 / IF4
-    float *d_if4_v = g_memory_allocator.allocate(BATCH * FC2_OUT);
-    float *d_if4_out = g_memory_allocator.allocate(BATCH * FC2_OUT);
-    // FC3 输出 logits
-    // logits 累积缓冲区
-    float* d_logits_sum = g_memory_allocator.allocate(BATCH * FC3_OUT);
-
-    float *d_conv1_out_2 = g_memory_allocator.allocate(BATCH * C1_N);
-    float *d_if1_v_2 = g_memory_allocator.allocate(BATCH * C1_N);
-    float *d_if1_out_2 = g_memory_allocator.allocate(BATCH * C1_N);
-    float *d_pool1_out_2 = g_memory_allocator.allocate(BATCH * P1_N);
-    float *d_if2_v_2 = g_memory_allocator.allocate(BATCH * C2_N);
-    float *d_if2_out_2 = g_memory_allocator.allocate(BATCH * C2_N);
-    float *d_pool2_out_2 = g_memory_allocator.allocate(BATCH * P2_N);
-    float *d_if3_v_2 = g_memory_allocator.allocate(BATCH * FC1_OUT);
-    float *d_if3_out_2 = g_memory_allocator.allocate(BATCH * FC1_OUT);
-    float *d_if4_v_2 = g_memory_allocator.allocate(BATCH * FC2_OUT);
-    float *d_if4_out_2 = g_memory_allocator.allocate(BATCH * FC2_OUT);
-    float* d_logits_sum_2 = g_memory_allocator.allocate(BATCH * FC3_OUT);
-
+    init_static_pointers();
     // 检查分配是否成功
     if (!d_conv1_out || !d_if1_v || !d_if1_out || !d_pool1_out ||
         !d_if2_v || !d_if2_out || !d_pool2_out ||
@@ -596,8 +655,6 @@ __global__ void maxpool2d_forward_batch_ptx(
     int idx_out = ((n * C + c) * H_out + h_out) * W_out + w_out;
     asm("st.global.f32 [%0], %1;" :: "l"(out + idx_out), "f"(max_val));
 }
-
-
 
 // IF 脉冲神经元：逐元素更新膜电位并生成 0/1 脉冲
 __global__ void ifnode_forward(
