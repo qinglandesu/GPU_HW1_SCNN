@@ -10,13 +10,13 @@
 #include <queue>
 #include <mutex>
 
-/*
+/**/
 __device__ __host__ uint32_t __builtin_bswap32(uint32_t val) {
     return ((val & 0x000000FF) << 24) |
            ((val & 0x0000FF00) << 8) |
            ((val & 0x00FF0000) >> 8) |
            ((val & 0xFF000000) >> 24);
-}*/
+}
 
 __constant__ float d_conv1_w_const[6 * 1 * 5 * 5];
 __constant__ float d_conv1_b_const[6];
@@ -299,8 +299,8 @@ std::vector<int> scnn_inference(
     predictions.reserve(num_images);
 
     cudaStream_t stream1, stream2;
-    cudaStreamCreate(&stream1);
-    cudaStreamCreate(&stream2);
+    checkCudaErrors(cudaStreamCreateWithFlags(&stream1, cudaStreamNonBlocking));
+    checkCudaErrors(cudaStreamCreateWithFlags(&stream2, cudaStreamNonBlocking));
 
     // 分配中间特征图和膜电位的 GPU 缓冲区
     init_static_pointers();
@@ -316,8 +316,11 @@ std::vector<int> scnn_inference(
         return predictions;
     }
 
-    // host 端读取 logits 用于 argmax
-    std::vector<float> h_logits(BATCH * FC3_OUT);
+    // 两块独立的 pinned host memory，使两个 D2H 拷贝可以真正异步执行。
+    float* h_logits_1 = nullptr;
+    float* h_logits_2 = nullptr;
+    checkCudaErrors(cudaMallocHost(&h_logits_1, BATCH * FC3_OUT * sizeof(float)));
+    checkCudaErrors(cudaMallocHost(&h_logits_2, BATCH * FC3_OUT * sizeof(float)));
 
     std::vector<float> h_all_images(num_images * IMG_C * IMG_H * IMG_W);
     for (int i = 0; i < num_images; ++i) {
@@ -345,12 +348,12 @@ std::vector<int> scnn_inference(
         const float* d_input = d_all_images + base * IMG_C * IMG_H * IMG_W;
 
         // 把所有 IF 膜电位清零
-        cudaMemset(d_if1_v, 0, cur_batch * C1_N * sizeof(float));
-        cudaMemset(d_if2_v, 0, cur_batch * C2_N * sizeof(float));
-        cudaMemset(d_if3_v, 0, cur_batch * FC1_OUT * sizeof(float));
-        cudaMemset(d_if4_v, 0, cur_batch * FC2_OUT * sizeof(float));
+        checkCudaErrors(cudaMemsetAsync(d_if1_v, 0, cur_batch * C1_N * sizeof(float), stream1));
+        checkCudaErrors(cudaMemsetAsync(d_if2_v, 0, cur_batch * C2_N * sizeof(float), stream1));
+        checkCudaErrors(cudaMemsetAsync(d_if3_v, 0, cur_batch * FC1_OUT * sizeof(float), stream1));
+        checkCudaErrors(cudaMemsetAsync(d_if4_v, 0, cur_batch * FC2_OUT * sizeof(float), stream1));
         // logits_sum 清零
-        cudaMemset(d_logits_sum, 0, cur_batch * FC3_OUT * sizeof(float));
+        checkCudaErrors(cudaMemsetAsync(d_logits_sum, 0, cur_batch * FC3_OUT * sizeof(float), stream1));
 
         // 流1: 处理第一个batch
         process_batch(stream1, d_input, cur_batch, 
@@ -367,12 +370,12 @@ std::vector<int> scnn_inference(
             const float* d_input_2 = d_all_images + (base + BATCH) * IMG_C * IMG_H * IMG_W;
             
             // 把所有 IF 膜电位清零
-            cudaMemset(d_if1_v_2, 0, cur_batch_2 * C1_N * sizeof(float));
-            cudaMemset(d_if2_v_2, 0, cur_batch_2 * C2_N * sizeof(float));
-            cudaMemset(d_if3_v_2, 0, cur_batch_2 * FC1_OUT * sizeof(float));
-            cudaMemset(d_if4_v_2, 0, cur_batch_2 * FC2_OUT * sizeof(float));
+            checkCudaErrors(cudaMemsetAsync(d_if1_v_2, 0, cur_batch_2 * C1_N * sizeof(float), stream2));
+            checkCudaErrors(cudaMemsetAsync(d_if2_v_2, 0, cur_batch_2 * C2_N * sizeof(float), stream2));
+            checkCudaErrors(cudaMemsetAsync(d_if3_v_2, 0, cur_batch_2 * FC1_OUT * sizeof(float), stream2));
+            checkCudaErrors(cudaMemsetAsync(d_if4_v_2, 0, cur_batch_2 * FC2_OUT * sizeof(float), stream2));
             // logits_sum 清零
-            cudaMemset(d_logits_sum_2, 0, cur_batch_2 * FC3_OUT * sizeof(float));
+            checkCudaErrors(cudaMemsetAsync(d_logits_sum_2, 0, cur_batch_2 * FC3_OUT * sizeof(float), stream2));
 
             // 流2: 处理第二个batch（与流1并行）
             process_batch(stream2, d_input_2, cur_batch_2, 
@@ -384,20 +387,30 @@ std::vector<int> scnn_inference(
                         d_fc3_w, d_fc3_b);
         }
 
-        // 等待两个流完成
-        cudaStreamSynchronize(stream1);
         // 5. 把 logits_sum 拷回 CPU，除以 T，然后 argmax 得到预测类别
-        cudaMemcpy(
-            h_logits.data(),
+        checkCudaErrors(cudaMemcpyAsync(
+            h_logits_1,
             d_logits_sum,
             cur_batch * FC3_OUT * sizeof(float),
-            cudaMemcpyDeviceToHost
-        );
+            cudaMemcpyDeviceToHost,
+            stream1
+        ));
+        if(cur_batch_2 > 0)
+        {
+            checkCudaErrors(cudaMemcpyAsync(
+                h_logits_2,
+                d_logits_sum_2,
+                cur_batch_2 * FC3_OUT * sizeof(float),
+                cudaMemcpyDeviceToHost,
+                stream2
+            ));
+        }
+        checkCudaErrors(cudaStreamSynchronize(stream1));
         for (int n = 0; n < cur_batch; ++n) {
             int pred = 0;
-            float best = h_logits[n * FC3_OUT] / T;
+            float best = h_logits_1[n * FC3_OUT] / T;
             for (int k = 1; k < FC3_OUT; ++k) {
-                float v = h_logits[n * FC3_OUT + k] / T;
+                float v = h_logits_1[n * FC3_OUT + k] / T;
                 if (v > best) {
                     best = v;
                     pred = k;
@@ -405,21 +418,14 @@ std::vector<int> scnn_inference(
             }
             predictions.push_back(pred);
         }
-        cudaStreamSynchronize(stream2);
-        // 5. 把 logits_sum 拷回 CPU，除以 T，然后 argmax 得到预测类别
         if(cur_batch_2 > 0)
         {
-            cudaMemcpy(
-                h_logits.data(),
-                d_logits_sum_2,
-                cur_batch_2 * FC3_OUT * sizeof(float),
-                cudaMemcpyDeviceToHost
-            );
+            checkCudaErrors(cudaStreamSynchronize(stream2));
             for (int n = 0; n < cur_batch_2; ++n) {
                 int pred = 0;
-                float best = h_logits[n * FC3_OUT] / T;
+                float best = h_logits_2[n * FC3_OUT] / T;
                 for (int k = 1; k < FC3_OUT; ++k) {
-                    float v = h_logits[n * FC3_OUT + k] / T;
+                    float v = h_logits_2[n * FC3_OUT + k] / T;
                     if (v > best) {
                         best = v;
                         pred = k;
@@ -430,7 +436,11 @@ std::vector<int> scnn_inference(
         }
     } // image loop
 
-    // Memory is freed in main.
+    checkCudaErrors(cudaFree(d_all_images));
+    checkCudaErrors(cudaFreeHost(h_logits_1));
+    checkCudaErrors(cudaFreeHost(h_logits_2));
+    checkCudaErrors(cudaStreamDestroy(stream1));
+    checkCudaErrors(cudaStreamDestroy(stream2));
 
     return predictions;
 }
@@ -445,9 +455,9 @@ int main(int argc, char* argv[]) {
     }
 	std::string dir = argv[1];
 	
-    // Load test data
-    auto images = read_mnist_images(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
-    auto labels = read_mnist_labels(dir + "/../../.." + "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
+    // Load test data"/../../.." +"/../../.." +
+    auto images = read_mnist_images(dir +  "/data/FashionMNIST/raw/t10k-images-idx3-ubyte");
+    auto labels = read_mnist_labels(dir +  "/data/FashionMNIST/raw/t10k-labels-idx1-ubyte");
     if (images.empty() || labels.empty()) return 1;
 
     // Load model parameters to host memory
@@ -1295,7 +1305,7 @@ void process_batch(
         // = 1 * 20 * 20 = 400 float ≈ 1.6KB
 
         conv1_forward_shared_const<BLOCK_H, BLOCK_W>
-            <<<grid, block, shared_bytes>>>(
+            <<<grid, block, shared_bytes, stream>>>(
                 d_input,       // [cur_batch,1,28,28]
                 d_conv1_out,   // [cur_batch,6,24,24]
                 cur_batch,
@@ -1309,7 +1319,7 @@ void process_batch(
         // (2) IF1: conv1_out -> if1_out (0/1)，更新 d_if1_v
         {
             int blocks = (cur_batch * C1_N + THREADS - 1) / THREADS;
-            ifnode_forward_ptx<<<blocks, THREADS>>>(
+            ifnode_forward_ptx<<<blocks, THREADS, 0, stream>>>(
                 d_conv1_out,
                 d_if1_v,
                 d_if1_out,
@@ -1328,7 +1338,7 @@ void process_batch(
                 cur_batch * C1_OUT_C             // 合并 N 和 C
             );
 
-            maxpool2d_forward_batch_ptx<<<grid, block>>>(
+            maxpool2d_forward_batch_ptx<<<grid, block, 0, stream>>>(
                 d_if1_out,    // in:  [cur_batch, 6, 24, 24]
                 d_pool1_out,  // out: [cur_batch, 6, 12, 12]
                 cur_batch, C1_OUT_C,
@@ -1355,7 +1365,7 @@ void process_batch(
             // = 6 * 12 * 12 = 864 float ≈ 3.4KB
 
             conv2_if2_forward_shared_const_optimized<BLOCK_H, BLOCK_W>
-                <<<grid, block, shared_bytes>>>(
+                <<<grid, block, shared_bytes, stream>>>(
                     d_pool1_out,   // [cur_batch,6,12,12]
                     d_if2_v,       // IF2膜电位
                     d_if2_out,     // IF2输出脉冲
@@ -1375,7 +1385,7 @@ void process_batch(
                 cur_batch * C2_OUT_C             // 合并 N 和 C
             );
 
-            maxpool2d_forward_batch_ptx<<<grid, block>>>(
+            maxpool2d_forward_batch_ptx<<<grid, block, 0, stream>>>(
                 d_if2_out,    // in:  [cur_batch, 16, 8, 8]
                 d_pool2_out,  // out: [cur_batch, 16, 4, 4]
                 cur_batch, C2_OUT_C,
@@ -1389,7 +1399,7 @@ void process_batch(
         {
             int total = cur_batch * FC1_OUT;
             int blocks_fc1 = (total + THREADS - 1) / THREADS;
-            fc_if_forward_batch_optimized<<<blocks_fc1, THREADS>>>(
+            fc_if_forward_batch_optimized<<<blocks_fc1, THREADS, 0, stream>>>(
                 d_pool2_out,   // x: [N,256]
                 d_fc1_w, d_fc1_b,
                 d_if3_v,       // v: [N,120]
@@ -1405,7 +1415,7 @@ void process_batch(
         {
             int total = cur_batch * FC2_OUT;
             int blocks_fc2 = (total + THREADS - 1) / THREADS;
-            fc_if_forward_batch_optimized<<<blocks_fc2, THREADS>>>(
+            fc_if_forward_batch_optimized<<<blocks_fc2, THREADS, 0, stream>>>(
                 d_if3_out,     // x: [N,120]
                 d_fc2_w, d_fc2_b,
                 d_if4_v,       // v: [N,84]
@@ -1422,7 +1432,7 @@ void process_batch(
         {
             int total = cur_batch * FC3_OUT;
             int blocks = (total + THREADS - 1) / THREADS;
-            fc3_and_accumulate_batch<<<blocks, THREADS>>>(
+            fc3_and_accumulate_batch<<<blocks, THREADS, 0, stream>>>(
                 d_if4_out, d_fc3_w, d_fc3_b,
                 d_logits_sum,
                 cur_batch,
